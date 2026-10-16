@@ -184,12 +184,21 @@ def test_resolve_dfs_referral_no_links(reset_config, monkeypatch, mocker):
     dfs_mock.side_effect = [no_referral]
     monkeypatch.setattr(io, "dfs_request", dfs_mock)
 
+    ipc_tree = mocker.MagicMock()
+    get_tree_mock = mocker.MagicMock(return_value=(ipc_tree, ""))
+    monkeypatch.setattr(io, "get_smb_tree", get_tree_mock)
+
     raw_io = mocker.MagicMock()
     raw_io.name = r"\\server\dfs"
     raw_io.fd.tree_connect.is_dfs_share = True
+    raw_io.fd.tree_connect.share_name = r"\\server\dfs"
 
     with pytest.raises(ObjectPathNotFound):
         list(io._resolve_dfs(raw_io))
+
+    # MS-SMB2 3.2.4.20.3 - the referral request is sent over the IPC$ share.
+    assert get_tree_mock.call_args[0][0] == r"\\server\IPC$"
+    assert dfs_mock.call_args[0] == (ipc_tree, r"\server\dfs")
 
 
 def test_raw_io_translates_smb_response_to_os_error(mocker):

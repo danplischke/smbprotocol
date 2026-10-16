@@ -14,6 +14,7 @@ from smbprotocol.structure import (
     IntField,
     Structure,
     TextField,
+    offset_padding_field,
 )
 
 log = logging.getLogger(__name__)
@@ -180,6 +181,8 @@ class SMB2ChangeNotifyResponse(Structure):
                         default=lambda s: len(s["buffer"]),
                     ),
                 ),
+                # MS-SMB2 3.2.5.16 - the buffer is located by OutputBufferOffset.
+                ("padding", offset_padding_field("output_buffer_offset", "output_buffer_length", 72)),
                 (
                     "buffer",
                     BytesField(

@@ -896,3 +896,24 @@ class TextField(BytesField):
 
         self.set_value(raw_value)
         return data[size:]
+
+
+def offset_padding_field(offset_field, length_field, buffer_start):
+    """
+    Creates a BytesField that consumes any bytes between the end of the fixed part of a structure and the variable
+    buffer located by an offset field. SMB2 responses describe their buffers with an offset from the start of the SMB2
+    header and a server may add padding before the buffer.
+
+    :param offset_field: The name of the field containing the buffer offset relative to the start of the SMB2 header.
+    :param length_field: The name of the field containing the buffer length.
+    :param buffer_start: The offset, relative to the start of the SMB2 header, where this field begins.
+    :return: The BytesField for the padding.
+    """
+
+    def size(structure):
+        if not structure[length_field].get_value():
+            return 0
+
+        return max(0, structure[offset_field].get_value() - buffer_start)
+
+    return BytesField(size=size, default=lambda s: b"\x00" * size(s))

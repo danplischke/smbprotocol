@@ -5,7 +5,7 @@ import io
 import logging
 import warnings
 
-from smbclient._pool import ClientConfig, dfs_request, get_smb_tree
+from smbclient._pool import ClientConfig, dfs_request, get_smb_tree, replace_dfs_path
 from smbprotocol import MAX_PAYLOAD_SIZE
 from smbprotocol.exceptions import (
     NoMoreFiles,
@@ -18,6 +18,7 @@ from smbprotocol.exceptions import (
     SMBResponseException,
 )
 from smbprotocol.file_info import FileAttributes, FileEndOfFileInformation
+from smbprotocol.header import NtStatus
 from smbprotocol.ioctl import IOCTLFlags, SMB2IOCTLRequest, SMB2IOCTLResponse
 from smbprotocol.open import (
     CreateDisposition,
@@ -64,7 +65,6 @@ def _parse_share_access(raw, mode):
 
 
 def _parse_mode(raw, invalid=""):
-    create_disposition = 0
     disposition_map = {
         "r": CreateDisposition.FILE_OPEN,
         "w": CreateDisposition.FILE_OVERWRITE_IF,
@@ -80,17 +80,22 @@ def _parse_mode(raw, invalid=""):
             del disposition_map[invalid_char]
 
     for c in raw:
-        dispo_val = disposition_map.get(c)
-        if dispo_val is None:
+        if c not in disposition_map:
             chars = ", ".join(sorted(disposition_map.keys()))
             raise ValueError(
                 f"Invalid mode char {c}, can only be {chars}",
             )
 
-        create_disposition |= dispo_val
-
-    if create_disposition == 0:
+    # Like the builtin open(), exactly one of r, w, x, or a must be set. Combining them would produce an invalid or
+    # unexpected CreateDisposition value, MS-SMB2 2.2.13.
+    primary = [c for c in raw if c in "rwxa"]
+    if not primary:
         raise ValueError(f"Invalid mode value {raw}, must contain at least r, w, x, or a")
+
+    elif len(primary) > 1:
+        raise ValueError(f"Invalid mode value {raw}, must contain only one of r, w, x, or a")
+
+    create_disposition = disposition_map[primary[0]]
 
     return create_disposition
 
@@ -109,6 +114,10 @@ def _chunk_size(connection, length, operation):
 
     # Determine the maximum data length we can send for the operation. We do this by checking the available credits and
     # calculating whatever is the smallest; length, negotiated operation size, available credit size).
+    if not connection.supports_multi_credit:
+        # MS-SMB2 3.2.4.1.5 - without multi-credit support the payload is limited to 64KiB.
+        max_size = min(max_size, MAX_PAYLOAD_SIZE)
+
     available_credits = connection.sequence_window["high"] - connection.sequence_window["low"]
     chunk_size = min(length, max_size, available_credits * MAX_PAYLOAD_SIZE)
 
@@ -137,17 +146,19 @@ def _resolve_dfs(raw_io):
     # Path is on a DFS root that is linked to another server.
     client_config = ClientConfig()
     raw_path = raw_io.name
+    connection_kwargs = getattr(raw_io, f"_{SMBRawIO.__name__}__kwargs", {})
 
-    referral = dfs_request(raw_io.fd.tree_connect, raw_path[1:])
+    # MS-SMB2 3.2.4.20.3 - the referral request is sent over the IPC$ share of the server.
+    server = [p for p in raw_io.fd.tree_connect.share_name.split("\\") if p][0]
+    ipc_tree = get_smb_tree(rf"\\{server}\IPC$", **connection_kwargs)[0]
+    referral = dfs_request(ipc_tree, raw_path[1:])
     client_config.cache_referral(referral)
     info = client_config.lookup_referral([p for p in raw_path.split("\\") if p])
     if not info:
         raise ObjectPathNotFound()
 
-    connection_kwargs = getattr(raw_io, f"_{SMBRawIO.__name__}__kwargs", {})
-
     for target in info:
-        new_path = raw_path.replace(info.dfs_path, target.target_path, 1)
+        new_path = replace_dfs_path(raw_path, info.dfs_path, target.target_path)
 
         try:
             tree, fd_path = get_smb_tree(new_path, **connection_kwargs)
@@ -214,6 +225,10 @@ def ioctl_request(transaction, ctl_code, output_size=0, flags=IOCTLFlags.SMB2_0_
 
     def _receive_resp(request):
         response = transaction.raw.fd.connection.receive(request)
+        if response["status"].get_value() == NtStatus.STATUS_BUFFER_OVERFLOW:
+            # The output is truncated and cannot be used, let the caller decide whether to retry with a larger buffer.
+            raise SMBResponseException(response)
+
         query_resp = SMB2IOCTLResponse()
         query_resp.unpack(response["data"].get_value())
         return query_resp["buffer"].get_value()
@@ -240,6 +255,10 @@ def query_info(transaction, info_class, flags=0, output_buffer_length=None):
 
     def _receive_resp(request):
         response = transaction.raw.fd.connection.receive(request)
+        if response["status"].get_value() == NtStatus.STATUS_BUFFER_OVERFLOW:
+            # The output is truncated and cannot be used, let the caller decide whether to retry with a larger buffer.
+            raise SMBResponseException(response)
+
         query_resp = SMB2QueryInfoResponse()
         query_resp.unpack(response["data"].get_value())
         return query_resp.parse_buffer(info_class)

@@ -5,8 +5,19 @@ import logging
 from collections import OrderedDict
 
 from smbprotocol import MAX_PAYLOAD_SIZE, Dialects
-from smbprotocol.create_contexts import SMB2CreateContextRequest
-from smbprotocol.exceptions import FileClosed, SMBException, SMBUnsupportedFeature
+from smbprotocol.create_contexts import (
+    SMB2CreateContextRequest,
+    SMB2CreateDurableHandleResponse,
+    SMB2CreateDurableHandleResponseV2,
+    SMB2CreateResponseLease,
+    SMB2CreateResponseLeaseV2,
+)
+from smbprotocol.exceptions import (
+    FileClosed,
+    SMBException,
+    SMBResponseException,
+    SMBUnsupportedFeature,
+)
 from smbprotocol.file_info import (  # While this shouldn't ever be removed, we need to keep this imported so we stay backwards compat. These were; originally defined here.
     FileAttributes,
     FileBothDirectoryInformation,
@@ -20,7 +31,7 @@ from smbprotocol.file_info import (  # While this shouldn't ever be removed, we 
     FileStreamInformation,
     InfoType,
 )
-from smbprotocol.header import Commands
+from smbprotocol.header import Commands, NtStatus
 from smbprotocol.structure import (
     BytesField,
     DateTimeField,
@@ -30,6 +41,7 @@ from smbprotocol.structure import (
     ListField,
     Structure,
     StructureField,
+    offset_padding_field,
 )
 
 log = logging.getLogger(__name__)
@@ -657,6 +669,8 @@ class SMB2ReadResponse(Structure):
                 ("data_length", IntField(size=4, default=lambda s: len(s["buffer"]))),
                 ("data_remaining", IntField(size=4)),
                 ("reserved2", IntField(size=4)),
+                # MS-SMB2 3.2.5.11 - the data is located by DataOffset.
+                ("padding", offset_padding_field("data_offset", "data_length", 80)),
                 ("buffer", BytesField(size=lambda s: s["data_length"].get_value())),
             ]
         )
@@ -806,6 +820,7 @@ class SMB2LockElement(Structure):
         self.fields = OrderedDict(
             [
                 ("offset", IntField(size=8)),
+                # Signed so -1 can be used for 0xFFFFFFFFFFFFFFFF, the length to lock to the end of the file.
                 ("length", IntField(size=8, unsigned=False)),
                 ("flags", FlagField(size=4, flag_type=LockFlags)),
                 ("reserved", IntField(size=4, default=0)),
@@ -861,6 +876,91 @@ class SMB2LockResponse(Structure):
         super(SMB2LockResponse, self).__init__()
 
 
+class LeaseBreakFlags:
+    """
+    [MS-SMB2] 2.2.23.2 Lease Break Notification Flags
+    """
+
+    SMB2_NOTIFY_BREAK_LEASE_FLAG_ACK_REQUIRED = 0x01
+
+
+class SMB2OplockBreakNotification(Structure):
+    """
+    [MS-SMB2] 2.2.23.1 Oplock Break Notification, 2.2.24.1 Oplock Break Acknowledgment and 2.2.25.1 Oplock Break
+    Response.
+
+    The three messages share the same layout.
+    """
+
+    COMMAND = Commands.SMB2_OPLOCK_BREAK
+
+    def __init__(self):
+        self.fields = OrderedDict(
+            [
+                ("structure_size", IntField(size=2, default=24)),
+                ("oplock_level", IntField(size=1)),
+                ("reserved", IntField(size=1)),
+                ("reserved2", IntField(size=4)),
+                ("file_id", BytesField(size=16)),
+            ]
+        )
+        super().__init__()
+
+
+SMB2OplockBreakAcknowledgment = SMB2OplockBreakNotification
+SMB2OplockBreakResponse = SMB2OplockBreakNotification
+
+
+class SMB2LeaseBreakNotification(Structure):
+    """
+    [MS-SMB2] 2.2.23.2 Lease Break Notification
+    """
+
+    COMMAND = Commands.SMB2_OPLOCK_BREAK
+
+    def __init__(self):
+        self.fields = OrderedDict(
+            [
+                ("structure_size", IntField(size=2, default=44)),
+                ("new_epoch", IntField(size=2)),
+                ("flags", FlagField(size=4, flag_type=LeaseBreakFlags)),
+                ("lease_key", BytesField(size=16)),
+                ("current_lease_state", IntField(size=4)),
+                ("new_lease_state", IntField(size=4)),
+                ("break_reason", IntField(size=4)),
+                ("access_mask_hint", IntField(size=4)),
+                ("share_mask_hint", IntField(size=4)),
+            ]
+        )
+        super().__init__()
+
+
+class SMB2LeaseBreakAcknowledgment(Structure):
+    """
+    [MS-SMB2] 2.2.24.2 Lease Break Acknowledgment and 2.2.25.2 Lease Break Response.
+
+    The two messages share the same layout.
+    """
+
+    COMMAND = Commands.SMB2_OPLOCK_BREAK
+
+    def __init__(self):
+        self.fields = OrderedDict(
+            [
+                ("structure_size", IntField(size=2, default=36)),
+                ("reserved", IntField(size=2)),
+                ("flags", IntField(size=4)),
+                ("lease_key", BytesField(size=16)),
+                ("lease_state", IntField(size=4)),
+                ("lease_duration", IntField(size=8)),
+            ]
+        )
+        super().__init__()
+
+
+SMB2LeaseBreakResponse = SMB2LeaseBreakAcknowledgment
+
+
 class SMB2QueryDirectoryResponse(Structure):
     """
     [MS-SMB2] v53.0 2017-09-15
@@ -877,6 +977,8 @@ class SMB2QueryDirectoryResponse(Structure):
                 ("structure_size", IntField(size=2, default=9)),
                 ("output_buffer_offset", IntField(size=2, default=72)),
                 ("output_buffer_length", IntField(size=4, default=lambda s: len(s["buffer"]))),
+                # MS-SMB2 3.2.5.15 - the buffer is located by OutputBufferOffset.
+                ("padding", offset_padding_field("output_buffer_offset", "output_buffer_length", 72)),
                 # this structure varies based on the requested information class
                 ("buffer", BytesField(size=lambda s: s["output_buffer_length"].get_value())),
             ]
@@ -991,6 +1093,8 @@ class SMB2QueryInfoResponse(Structure):
                         default=lambda s: len(s["buffer"]),
                     ),
                 ),
+                # MS-SMB2 3.2.5.17 - the buffer is located by OutputBufferOffset.
+                ("padding", offset_padding_field("output_buffer_offset", "output_buffer_length", 72)),
                 (
                     "buffer",
                     BytesField(
@@ -1004,25 +1108,25 @@ class SMB2QueryInfoResponse(Structure):
     def parse_buffer(self, file_info_type):
         buffer = self["buffer"].get_value()
 
-        def unpack_list(buffer, byte_boundary):
+        def unpack_list(buffer):
+            # Each entry is located by the NextEntryOffset of the previous entry, 0 marks the last entry.
             info_list = []
+            offset = 0
             while buffer:
                 entry = file_info_type()
-                buffer = entry.unpack(buffer)
-
-                padded_size = len(entry) % byte_boundary
-                buffer_offset = (byte_boundary - padded_size) if padded_size else 0
-                buffer = buffer[buffer_offset:]
-
+                entry.unpack(buffer[offset:])
                 info_list.append(entry)
+
+                next_entry_offset = entry["next_entry_offset"].get_value()
+                if next_entry_offset == 0:
+                    break
+                offset += next_entry_offset
 
             return info_list
 
         file_obj = file_info_type()
-        if isinstance(file_obj, FileFullEaInformation):
-            return unpack_list(buffer, 4)
-        elif isinstance(file_obj, FileStreamInformation):
-            return unpack_list(buffer, 8)
+        if isinstance(file_obj, (FileFullEaInformation, FileStreamInformation)):
+            return unpack_list(buffer)
         else:
             file_obj.unpack(buffer)
             return file_obj
@@ -1144,7 +1248,13 @@ class Open:
         # lock and unlock operations performed on resilient Opens. Contains
         #     sequence_number - 4-bit integer modulo 16
         #     free - boolean value where False is no outstanding requests
+        # The list index is the LockSequenceIndex, index 0 is reserved and never used.
         self.operation_buckets = []
+
+        # Set when the open was granted a lease, used to process lease break notifications.
+        self.lease_key = None
+        self.lease_state = None
+        self.lease_epoch = None
 
         # SMB 3.x+
         self.durable_timeout = None
@@ -1234,12 +1344,13 @@ class Open:
         if create_contexts:
             create["buffer_contexts"] = SMB2CreateContextRequest.pack_multiple(create_contexts)
 
-        if self.connection.dialect >= Dialects.SMB_3_0_0:
-            self.desired_access = desired_access
-            self.share_mode = share_access
-            self.create_options = create_options
-            self.file_attributes = file_attributes
-            self.create_disposition = create_disposition
+        # MS-SMB2 3.2.5.7 - these are kept from the request. Open.file_attributes is updated with the attributes the
+        # server returns once the create has completed.
+        self.desired_access = desired_access
+        self.share_mode = share_access
+        self.create_options = create_options
+        self.file_attributes = file_attributes
+        self.create_disposition = create_disposition
 
         if not send:
             return create, self._create_response
@@ -1288,11 +1399,26 @@ class Open:
         self.end_of_file = create_response["end_of_file"].get_value()
         self.file_attributes = create_response["file_attributes"].get_value()
 
+        # MS-SMB2 3.2.5.7 - initialise the operation buckets used for lock sequence numbers, index 0 is reserved.
+        self.operation_buckets = [None] + [{"sequence_number": 0, "free": True} for _ in range(64)]
+
         create_contexts_response = None
         if create_response["create_contexts_length"].get_value() > 0:
             create_contexts_response = []
             for context in create_response["buffer"].get_value():
-                create_contexts_response.append(context.get_context_data())
+                context_data = context.get_context_data()
+                create_contexts_response.append(context_data)
+
+                if isinstance(context_data, (SMB2CreateDurableHandleResponse, SMB2CreateDurableHandleResponseV2)):
+                    # MS-SMB2 3.2.5.7.1 and 3.2.5.7.5
+                    self.durable = True
+
+                elif isinstance(context_data, (SMB2CreateResponseLease, SMB2CreateResponseLeaseV2)):
+                    # MS-SMB2 3.2.5.7.4
+                    self.lease_key = context_data["lease_key"].get_value()
+                    self.lease_state = context_data["lease_state"].get_value()
+                    if isinstance(context_data, SMB2CreateResponseLeaseV2):
+                        self.lease_epoch = context_data["epoch"].get_value()
 
         return create_contexts_response
 
@@ -1513,6 +1639,9 @@ class Open:
         query = SMB2QueryDirectoryRequest()
         query["file_information_class"] = file_information_class
         query["flags"] = flags
+        if file_index:
+            # MS-SMB2 3.2.4.17 - the FileIndex is only used when SMB2_INDEX_SPECIFIED is set.
+            query["flags"].set_flag(QueryDirectoryFlags.SMB2_INDEX_SPECIFIED)
         query["file_index"] = file_index
         query["file_id"] = self.file_id
         query["output_buffer_length"] = max_output
@@ -1546,6 +1675,11 @@ class Open:
         query_request.unpack(request.message["data"].get_value())
         file_cl = query_request["file_information_class"].get_value()
         data = query_response["buffer"].get_value()
+        if not data:
+            # MS-SMB2 3.2.5.15 - STATUS_BUFFER_OVERFLOW can be returned with no entries when all the entries that would
+            # have fit were filtered out by the server, the enumeration can continue with the next request.
+            return []
+
         results = SMB2QueryDirectoryRequest.unpack_response(file_cl, data)
         return results
 
@@ -1604,10 +1738,8 @@ class Open:
             c_resp.unpack(response["data"].get_value())
             log.debug(c_resp)
 
-            # update the attributes if requested
-            close_request = SMB2CloseRequest()
-            close_request.unpack(request.message["data"].get_value())
-            if close_request["flags"].has_flag(CloseFlags.SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB):
+            # MS-SMB2 3.2.5.9 - the attribute fields are only valid if the server set the flag in the response.
+            if c_resp["flags"].has_flag(CloseFlags.SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB):
                 self.creation_time = c_resp["creation_time"].get_value()
                 self.last_access_time = c_resp["last_access_time"].get_value()
                 self.last_write_time = c_resp["last_write_time"].get_value()
@@ -1631,15 +1763,41 @@ class Open:
         can be used to get the response from the server by passing in the
         Request that was used to sent it out of band.
 
+        When the open is resilient, persistent, or the connection supports
+        multichannel, the LockSequenceNumber and LockSequenceIndex are taken
+        from a free operation bucket as required by MS-SMB2 3.2.4.19 unless
+        explicitly set by the caller.
+
         :param locks: (List<SMB2LockElement>) byte ranges to lock or unlock
-        :param lsn: LockSequenceNumber. Only used for SMB dialects > 2.0.2
-        :param lsi: LockSequenceIndex. Only used for SMB dialects > 2.0.2
+        :param lsn: LockSequenceNumber (0-15). Only used for SMB dialects > 2.0.2
+        :param lsi: LockSequenceIndex (1-64), 0 selects an operation bucket
+            automatically when one is required. Only used for SMB dialects >
+            2.0.2
         :param wait: If send=True, whether to wait for a response if
             STATUS_PENDING was received from the server or fail.
         :param send: Whether to send the request in the same call or return the
             message to the caller and the unpack function
         :return: SMB2LockResponse message received from the server
         """
+
+        if not locks:
+            raise ValueError("At least one lock element must be specified")
+
+        valid_flags = [
+            LockFlags.SMB2_LOCKFLAG_SHARED_LOCK,
+            LockFlags.SMB2_LOCKFLAG_EXCLUSIVE_LOCK,
+            LockFlags.SMB2_LOCKFLAG_SHARED_LOCK | LockFlags.SMB2_LOCKFLAG_FAIL_IMMEDIATELY,
+            LockFlags.SMB2_LOCKFLAG_EXCLUSIVE_LOCK | LockFlags.SMB2_LOCKFLAG_FAIL_IMMEDIATELY,
+            LockFlags.SMB2_LOCKFLAG_UNLOCK,
+        ]
+        for lock_element in locks:
+            flags = lock_element["flags"]
+            if len(locks) > 1 and not flags.has_flag(LockFlags.SMB2_LOCKFLAG_UNLOCK):
+                # MS-SMB2 3.2.4.19 - a request with multiple locks MUST fail immediately.
+                flags.set_flag(LockFlags.SMB2_LOCKFLAG_FAIL_IMMEDIATELY)
+
+            if flags.get_value() not in valid_flags:
+                raise ValueError(f"Invalid lock flags combination 0x{flags.get_value():X}, see MS-SMB2 2.2.26.1")
 
         lock = SMB2LockRequest()
         lock["file_id"] = self.file_id
@@ -1649,11 +1807,28 @@ class Open:
             if (lsn < 0) or (lsn > 15):
                 raise ValueError("lsn (LockSequenceNumber) must be between 0 and 15")
 
-            # MS-SMB2 2.2.26 requires that 0 <= lsi <= 64
+            # MS-SMB2 2.2.26 requires that 0 <= lsi <= 64 where 0 is reserved
             if (lsi < 0) or (lsi > 64):
                 raise ValueError("lsi (LockSequenceIndex) must be between 0 and 64")
 
-            lock["lock_sequence"] = (lsn << 28) + lsi
+            if lsi == 0 and lsn != 0:
+                raise ValueError("lsn (LockSequenceNumber) requires a non-zero lsi (LockSequenceIndex)")
+
+            if lsi == 0 and (self.resilient_handle or self.is_persistent or self.connection.supports_multi_channel):
+                # MS-SMB2 3.2.4.19 - pick a free operation bucket for the lock sequence.
+                lsi = next(
+                    (idx for idx, b in enumerate(self.operation_buckets) if b is not None and b["free"]),
+                    0,
+                )
+                if lsi == 0:
+                    raise SMBException("No free operation bucket is available for the lock request")
+
+                bucket = self.operation_buckets[lsi]
+                bucket["free"] = False
+                lsn = bucket["sequence_number"]
+
+            # LockSequenceNumber is the 4 least significant bits, LockSequenceIndex the remaining 28 bits.
+            lock["lock_sequence"] = (lsi << 4) | lsn
 
         if not send:
             return lock, self._lock_response
@@ -1662,8 +1837,26 @@ class Open:
         return self._lock_response(request, wait)
 
     def _lock_response(self, request, wait=True):
-        response = self.connection.receive(request, wait=wait)
+        try:
+            response = self.connection.receive(request, wait=wait)
+        except SMBResponseException:
+            self._release_operation_bucket(request)
+            raise
+
+        if response["status"].get_value() != NtStatus.STATUS_PENDING:
+            self._release_operation_bucket(request)
+
         lock_response = SMB2LockResponse()
         lock_response.unpack(response["data"].get_value())
 
         return lock_response
+
+    def _release_operation_bucket(self, request):
+        # MS-SMB2 3.2.5.13 - free the operation bucket used by the request and increment its sequence number.
+        lock_request = SMB2LockRequest()
+        lock_request.unpack(request.message["data"].get_value())
+        lsi = lock_request["lock_sequence"].get_value() >> 4
+        if 0 < lsi < len(self.operation_buckets):
+            bucket = self.operation_buckets[lsi]
+            bucket["free"] = True
+            bucket["sequence_number"] = (bucket["sequence_number"] + 1) % 16

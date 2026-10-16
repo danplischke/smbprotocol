@@ -987,11 +987,8 @@ class TestConnection:
             assert len(connection.salt) == 32
             assert connection.sequence_window["low"] == 1
             assert connection.sequence_window["high"] == 2
-            assert (
-                connection.client_security_mode == SecurityMode.SMB2_NEGOTIATE_SIGNING_REQUIRED
-                if connection.server_security_mode & SecurityMode.SMB2_NEGOTIATE_SIGNING_REQUIRED
-                else SecurityMode.SMB2_NEGOTIATE_SIGNING_ENABLED
-            )
+            # MS-SMB2 3.2.4.2.2.2 - ClientSecurityMode stays as the value sent in the NEGOTIATE request.
+            assert connection.client_security_mode == SecurityMode.SMB2_NEGOTIATE_SIGNING_ENABLED
             assert connection.supports_encryption
 
             if connection.server_security_mode & SecurityMode.SMB2_NEGOTIATE_SIGNING_REQUIRED:

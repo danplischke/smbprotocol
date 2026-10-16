@@ -2,6 +2,38 @@
 
 ## 1.18.0 - TBD
 
+MS-SMB2 compliance fixes, see `specs/COMPLIANCE_AUDIT.md` for the full list with spec references.
+
+* Security
+  * Reject responses that are not signed when the session requires signing, previously a response without the `SMB2_FLAGS_SIGNED` flag was accepted without verification
+  * Require the final SMB 3.1.1 `SESSION_SETUP` response to be signed and verify it even when the session is encrypted
+  * Require the `VALIDATE_NEGOTIATE_INFO` response to be signed or encrypted and terminate the connection if the validation fails
+  * Validate the `NEGOTIATE` response, the selected dialect, cipher, signing and hash algorithms must have been offered by the client
+  * Validate decrypted messages belong to the session of the transform header and reject unknown protocol ids
+  * Fix `smbclient.register_session(encrypt=True)` not enabling encryption on an existing session
+* Revert the `Connection.client_security_mode` change from 1.17.0, it must stay as the value sent in the `NEGOTIATE` request as servers drop the connection when the `VALIDATE_NEGOTIATE_INFO` request does not match it
+* Acknowledge oplock and lease break notifications, previously any unsolicited message killed the connection
+* Discard responses that do not match an outstanding request instead of killing the connection
+* Keep a request that received `STATUS_PENDING` with `receive(wait=False)` so the final response can be received
+* Return the data of a `STATUS_BUFFER_OVERFLOW` response for `READ`, `IOCTL`, `QUERY_INFO`, and `QUERY_DIRECTORY` instead of raising `BufferOverflow`
+* Retry `smbclient.listxattr` and `smbclient.liststreams` with a larger buffer when the entries do not fit in 64KiB
+* Retry a DFS referral request with a larger buffer when the referrals do not fit
+* Wait for credits when a request needs more credits than available instead of failing, request at least 1 credit with each request, and stop adding credits the server did not grant
+* Calculate the credit charge for `QUERY_INFO`, `SET_INFO`, and `CHANGE_NOTIFY` requests based on the buffer sizes
+* Fix the `LockSequenceNumber` and `LockSequenceIndex` packing in `Open.lock()` and use the operation buckets when the connection supports multichannel
+* Validate the lock elements passed to `Open.lock()`
+* Read the response buffers based on the offset fields of the response
+* Fix the path used when following a symlink on a DFS share
+* Use the response flags to decide whether to use the attributes of a `CLOSE` response
+* Sign the SMB 3.1.1 `TREE_CONNECT` request even when signing is not required
+* Allow a guest session when the client does not require signing
+* Fail authentication when the server does not return `STATUS_SUCCESS` for the final `SESSION_SETUP` response
+* Set `Open.desired_access`, `Open.share_mode`, `Open.create_options`, and `Open.create_disposition` for all dialects and `Open.durable` when a durable handle was granted
+* Raise a `ValueError` in `smbclient.open_file` when the mode contains more than one of `r`, `w`, `x`, or `a`
+* Send DFS link referral requests over the `IPC$` share and match the DFS referral cache case insensitively
+* Fix parsing multiple error contexts, network interfaces, EA and stream lists, and symlink error responses with padding
+* Fix the negotiate context padding when an even number of dialects is offered
+
 ## 1.17.0 - 2026-07-07
 
 * Drop support for Python 3.9, minimum verison if now 3.10

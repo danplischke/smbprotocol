@@ -6,9 +6,11 @@ from __future__ import annotations
 import atexit
 import logging
 import ntpath
+import re
 import uuid
 from typing import Literal, Optional
 
+from smbprotocol import MAX_PAYLOAD_SIZE
 from smbprotocol._text import to_text
 from smbprotocol.connection import Capabilities, Connection
 from smbprotocol.dfs import (
@@ -23,7 +25,10 @@ from smbprotocol.exceptions import (
     FSDriverRequired,
     InvalidParameter,
     ObjectPathNotFound,
+    SMBException,
+    SMBResponseException,
 )
+from smbprotocol.header import NtStatus
 from smbprotocol.ioctl import CtlCode, IOCTLFlags, SMB2IOCTLRequest, SMB2IOCTLResponse
 from smbprotocol.session import Session
 from smbprotocol.tree import TreeConnect
@@ -155,7 +160,8 @@ class ClientConfig(metaclass=_ConfigSingleton):
         for referral in self._referral_cache:
             referral_path_components = [p for p in referral.dfs_path.split("\\") if p]
             for idx, referral_component in enumerate(referral_path_components):
-                if idx >= len(path_components) or referral_component != path_components[idx]:
+                # DFS path names are case insensitive.
+                if idx >= len(path_components) or referral_component.casefold() != path_components[idx].casefold():
                     break
 
             else:
@@ -187,20 +193,40 @@ class ClientConfig(metaclass=_ConfigSingleton):
         self._referral_cache = [refferal for refferal in self._referral_cache if not refferal.is_expired]
 
 
+def replace_dfs_path(path: str, dfs_path: str, target_path: str) -> str:
+    """Replaces the first occurrence of the DFS path in path with the target path, DFS paths are case insensitive."""
+    return re.sub(re.escape(dfs_path), lambda _: target_path, path, count=1, flags=re.IGNORECASE)
+
+
 def dfs_request(tree: TreeConnect, path: str) -> DFSReferralResponse:
     """Send a DFS Referral request to the IPC tree and return the referrals."""
     dfs_referral = DFSReferralRequest()
     dfs_referral["request_file_name"] = to_text(path)
 
-    ioctl_req = SMB2IOCTLRequest()
-    ioctl_req["ctl_code"] = CtlCode.FSCTL_DFS_GET_REFERRALS
-    ioctl_req["file_id"] = b"\xff" * 16
-    ioctl_req["max_output_response"] = 56 * 1024
-    ioctl_req["flags"] = IOCTLFlags.SMB2_0_IOCTL_IS_FSCTL
-    ioctl_req["buffer"] = dfs_referral
+    connection = tree.session.connection
+    max_output_response = 56 * 1024
+    while True:
+        ioctl_req = SMB2IOCTLRequest()
+        ioctl_req["ctl_code"] = CtlCode.FSCTL_DFS_GET_REFERRALS
+        ioctl_req["file_id"] = b"\xff" * 16
+        ioctl_req["max_output_response"] = max_output_response
+        ioctl_req["flags"] = IOCTLFlags.SMB2_0_IOCTL_IS_FSCTL
+        ioctl_req["buffer"] = dfs_referral
 
-    request = tree.session.connection.send(ioctl_req, sid=tree.session.session_id, tid=tree.tree_connect_id)
-    response = tree.session.connection.receive(request)
+        request = connection.send(ioctl_req, sid=tree.session.session_id, tid=tree.tree_connect_id)
+        response = connection.receive(request)
+        if response["status"].get_value() != NtStatus.STATUS_BUFFER_OVERFLOW:
+            break
+
+        # MS-SMB2 3.3.5.15.2 - the referrals did not fit in the output buffer, retry with the largest buffer the
+        # connection allows. A truncated referral response cannot be parsed.
+        largest_response = connection.max_transact_size
+        if not connection.supports_multi_credit:
+            largest_response = min(largest_response, MAX_PAYLOAD_SIZE)
+
+        if max_output_response >= largest_response:
+            raise SMBResponseException(response)
+        max_output_response = largest_response
 
     ioctl_resp = SMB2IOCTLResponse()
     ioctl_resp.unpack(response["data"].get_value())
@@ -285,7 +311,7 @@ def get_smb_tree(
     # Check if we've already got a referral match for the path specified and use that path instead.
     referral = client_config.lookup_referral(path_split)
     if referral and not referral.is_expired:
-        path = path.replace(referral.dfs_path, referral.target_hint.target_path, 1)
+        path = replace_dfs_path(path, referral.dfs_path, referral.target_hint.target_path)
         path_split = [p for p in path.split("\\") if p]
 
     else:
@@ -308,7 +334,7 @@ def get_smb_tree(
             if not referral:
                 raise ObjectPathNotFound()
 
-            path = path.replace(referral.dfs_path, referral.target_hint.target_path, 1)
+            path = replace_dfs_path(path, referral.dfs_path, referral.target_hint.target_path)
             path_split = [p for p in path.split("\\") if p]
 
     server = path_split[0]
@@ -442,7 +468,11 @@ def register_session(
         if session.encrypt_data and not encrypt:
             raise ValueError("Cannot disable encryption on an already negotiated session.")
         elif not session.encrypt_data and encrypt:
-            session.encrypt = True
+            if not connection.supports_encryption or not session.encryption_key:
+                raise SMBException("SMB encryption is required but the session does not support it")
+
+            session.encrypt_data = True
+            session.signing_required = False  # encryption covers signing, same as Session.connect()
 
     return session
 

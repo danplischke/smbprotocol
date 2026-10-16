@@ -292,11 +292,19 @@ class TestSMB2ErrorResponse:
         error_context = SMB2ErrorContextResponse()
         error_context["error_context_data"] = b"\x01\x02\x03\x04"
         message["error_data"] = [error_context]
+        # Each error context is padded to an 8-byte boundary, MS-SMB2 2.2.2.
         expected = (
-            b"\x09\x00" b"\x01" b"\x00" b"\x0c\x00\x00\x00" b"\x04\x00\x00\x00" b"\x00\x00\x00\x00" b"\x01\x02\x03\x04"
+            b"\x09\x00"
+            b"\x01"
+            b"\x00"
+            b"\x10\x00\x00\x00"
+            b"\x04\x00\x00\x00"
+            b"\x00\x00\x00\x00"
+            b"\x01\x02\x03\x04"
+            b"\x00\x00\x00\x00"
         )
         actual = message.pack()
-        assert len(message) == 20
+        assert len(message) == 24
         assert actual == expected
 
     def test_parse_message_plain(self):
@@ -336,9 +344,9 @@ class TestSMB2ErrorContextResponse:
         message = SMB2ErrorContextResponse()
         message["error_id"] = ErrorContextId.SMB2_ERROR_ID_SHARE_REDIRECT
         message["error_context_data"] = b"\x01\x02\x03\x04"
-        expected = b"\x04\x00\x00\x00" b"\x72\x64\x52\x53" b"\x01\x02\x03\x04"
+        expected = b"\x04\x00\x00\x00" b"\x72\x64\x52\x53" b"\x01\x02\x03\x04" b"\x00\x00\x00\x00"
         actual = message.pack()
-        assert len(message) == 12
+        assert len(message) == 16
         assert actual == expected
 
     def test_parse_message(self):

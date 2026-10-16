@@ -66,7 +66,7 @@ class CreateContextName:
             CreateContextName.SMB2_CREATE_QUERY_MAXIMAL_ACCESS_REQUEST: SMB2CreateQueryMaximalAccessResponse(),
             CreateContextName.SMB2_CREATE_QUERY_ON_DISK_ID: SMB2CreateQueryOnDiskIDResponse(),
             CreateContextName.SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2: SMB2CreateDurableHandleResponseV2(),
-            CreateContextName.SMB2_CREATE_DURABLE_HANDLE_RECONNECT_V2: SMB2CreateDurableHandleReconnectV2,
+            CreateContextName.SMB2_CREATE_DURABLE_HANDLE_RECONNECT_V2: SMB2CreateDurableHandleReconnectV2(),
             CreateContextName.SMB2_CREATE_APP_INSTANCE_ID: SMB2CreateAppInstanceId(),
             CreateContextName.SMB2_CREATE_APP_INSTANCE_VERSION: SMB2CreateAppInstanceVersion(),
         }.get(name, None)

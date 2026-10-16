@@ -17,6 +17,7 @@ from smbprotocol.structure import (
     Structure,
     StructureField,
     UuidField,
+    offset_padding_field,
 )
 
 
@@ -336,6 +337,9 @@ class SMB2IOCTLResponse(Structure):
                 ("output_count", IntField(size=4)),
                 ("flags", IntField(size=4, default=0)),
                 ("reserved2", IntField(size=4, default=0)),
+                # MS-SMB2 3.2.5.14 - the output is located by OutputOffset, a server may return the input buffer
+                # before it.
+                ("padding", offset_padding_field("output_offset", "output_count", 112)),
                 (
                     "buffer",
                     BytesField(
@@ -475,10 +479,17 @@ class SMB2NetworkInterfaceInfo(Structure):
         :return: List of SMB2NetworkInterfaceInfo messages
         """
         chunks = []
+        offset = 0
         while data:
             info = SMB2NetworkInterfaceInfo()
-            data = info.unpack(data)
+            info.unpack(data[offset:])
             chunks.append(info)
+
+            # MS-SMB2 2.2.32.5 - Next is the offset to the next entry, 0 for the last entry.
+            next_offset = info["next"].get_value()
+            if next_offset == 0:
+                break
+            offset += next_offset
 
         return chunks
 

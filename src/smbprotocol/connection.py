@@ -34,7 +34,15 @@ from smbprotocol.header import (
     SMB2HeaderRequest,
     SMB2HeaderResponse,
 )
-from smbprotocol.open import Open
+from smbprotocol.open import (
+    LeaseBreakFlags,
+    Open,
+    RequestedOplockLevel,
+    SMB2LeaseBreakAcknowledgment,
+    SMB2LeaseBreakNotification,
+    SMB2OplockBreakAcknowledgment,
+    SMB2OplockBreakNotification,
+)
 from smbprotocol.structure import (
     BytesField,
     DateTimeField,
@@ -290,11 +298,10 @@ class SMB3NegotiateRequest(Structure):
 
     @staticmethod
     def _padding_size(structure):
-        # Padding between the end of the buffer value and the first Negotiate
-        # context value so that the first value is 8-byte aligned. Padding is
-        # 4 is there are no dialects specified
-        mod = (structure["dialect_count"].get_value() * 2) % 8
-        return 0 if mod == 0 else mod
+        # Padding between the end of the dialects and the first Negotiate context value so that the first context is
+        # 8-byte aligned relative to the start of the SMB2 header (64 byte header + 36 byte fixed structure).
+        end_of_dialects = 64 + structure["structure_size"].get_value() + structure["dialect_count"].get_value() * 2
+        return (8 - (end_of_dialects % 8)) % 8
 
     @staticmethod
     def _default_padding_size(structure):
@@ -594,6 +601,13 @@ class SMB2NegotiateResponse(Structure):
                     ),
                 ),
                 (
+                    "buffer_padding",
+                    BytesField(
+                        size=SMB2NegotiateResponse._buffer_padding_size,
+                        default=lambda s: b"\x00" * SMB2NegotiateResponse._buffer_padding_size(s),
+                    ),
+                ),
+                (
                     "buffer",
                     BytesField(
                         size=lambda s: s["security_buffer_length"].get_value(),
@@ -636,10 +650,19 @@ class SMB2NegotiateResponse(Structure):
         if structure["dialect_revision"].get_value() == Dialects.SMB_3_1_1:
             buffer_offset = structure["security_buffer_offset"].get_value()
             buffer_size = structure["security_buffer_length"].get_value()
-            padding_size = SMB2NegotiateResponse._padding_size(structure)
+            padding_size = SMB2NegotiateResponse._minimal_padding_size(structure)
             return buffer_offset + buffer_size + padding_size
         else:
             return None
+
+    @staticmethod
+    def _buffer_padding_size(structure):
+        # MS-SMB2 3.2.5.2 - the security buffer is located by SecurityBufferOffset which is relative to the start of
+        # the SMB2 header, the fixed header and response structure take up the first 128 bytes.
+        if structure["security_buffer_length"].get_value() == 0:
+            return 0
+
+        return max(0, structure["security_buffer_offset"].get_value() - 128)
 
     @staticmethod
     def _padding_size(structure):
@@ -649,6 +672,21 @@ class SMB2NegotiateResponse(Structure):
         if structure["negotiate_context_count"].get_value() == 0:
             return 0
 
+        # MS-SMB2 3.2.5.2 - the context list is located by NegotiateContextOffset, use it when it is set rather than
+        # assuming the server used the minimal padding.
+        buffer_end = (
+            128
+            + SMB2NegotiateResponse._buffer_padding_size(structure)
+            + structure["security_buffer_length"].get_value()
+        )
+        context_offset = structure["negotiate_context_offset"].get_value()
+        if context_offset and context_offset >= buffer_end:
+            return context_offset - buffer_end
+
+        return SMB2NegotiateResponse._minimal_padding_size(structure)
+
+    @staticmethod
+    def _minimal_padding_size(structure):
         mod = structure["security_buffer_length"].get_value() % 8
         return 0 if mod == 0 else 8 - mod
 
@@ -746,6 +784,26 @@ class SMB2TransformHeader(Structure):
 
 
 class Connection:
+    # MS-SMB2 3.3.4.4 - commands where STATUS_BUFFER_OVERFLOW is returned with a valid, truncated, response body.
+    _BUFFER_OVERFLOW_COMMANDS = frozenset(
+        [
+            Commands.SMB2_READ,
+            Commands.SMB2_IOCTL,
+            Commands.SMB2_QUERY_INFO,
+            Commands.SMB2_QUERY_DIRECTORY,
+        ]
+    )
+
+    # Error responses that servers send unsigned even when the session requires signing because the session itself is
+    # gone or the request could not be associated with it. They are still raised to the caller as errors.
+    _UNSIGNED_ERROR_STATUSES = frozenset(
+        [
+            NtStatus.STATUS_USER_SESSION_DELETED,
+            NtStatus.STATUS_NETWORK_SESSION_EXPIRED,
+            NtStatus.STATUS_INVALID_PARAMETER,
+        ]
+    )
+
     def __init__(self, guid, server_name, port=445, require_signing=True):
         """
         [MS-SMB2] v53.0 2017-09-15
@@ -785,6 +843,8 @@ class Connection:
         # Table of available sequence numbers
         self.sequence_window = dict(low=0, high=1)
         self.sequence_lock = Lock()
+        # Signalled when the server grants credits so a request waiting for available message ids can continue.
+        self._credits_granted = threading.Condition(self.sequence_lock)
 
         # Byte array containing the negotiate token and remembered for
         # authentication
@@ -794,7 +854,10 @@ class Connection:
         self.max_transact_size = None
         self.max_read_size = None
         self.max_write_size = None
+        # RequireSigning is set to True if either the client or server requires signing. The client's own setting
+        # (RequireMessageSigning in MS-SMB2) is kept separately as it controls whether guest sessions are allowed.
         self.require_signing = require_signing
+        self.client_require_signing = require_signing
 
         # SMB 2.1+
         self.dialect = None
@@ -910,6 +973,12 @@ class Connection:
         ]
         smb_response = self._send_smb2_negotiate(dialect, timeout, enc_algos, sign_algos)
         log.info("Negotiated dialect: %s", smb_response["dialect_revision"])
+        try:
+            self._validate_negotiate_response(smb_response, enc_algos, sign_algos)
+        except SMBException:
+            self.disconnect(False)
+            raise
+
         self.dialect = smb_response["dialect_revision"].get_value()
         self.max_transact_size = smb_response["max_transact_size"].get_value()
         self.max_read_size = smb_response["max_read_size"].get_value()
@@ -917,11 +986,12 @@ class Connection:
         self.server_guid = smb_response["server_guid"].get_value()
         self.gss_negotiate_token = smb_response["buffer"].get_value()
 
+        # MS-SMB2 3.2.5.2 - RequireSigning is set when the server requires it. Connection.ClientSecurityMode must stay
+        # as the value sent in the NEGOTIATE request as it is echoed back in VALIDATE_NEGOTIATE_INFO.
         if not self.require_signing and smb_response["security_mode"].has_flag(
             SecurityMode.SMB2_NEGOTIATE_SIGNING_REQUIRED
         ):
             self.require_signing = True
-            self.client_security_mode = SecurityMode.SMB2_NEGOTIATE_SIGNING_REQUIRED
         log.info("Connection require signing: %s", self.require_signing)
 
         capabilities = smb_response["capabilities"]
@@ -960,6 +1030,52 @@ class Connection:
 
                 elif context_type == NegotiateContextType.SMB2_SIGNING_CAPABILITIES:
                     self.signing_algorithm_id = context["data"]["signing_algorithms"][0]
+
+    def _validate_negotiate_response(self, smb_response, encryption_algorithms, signing_algorithms):
+        """Validates the NEGOTIATE response as specified in MS-SMB2 3.2.5.2."""
+        dialect = smb_response["dialect_revision"].get_value()
+        if dialect not in self.negotiated_dialects:
+            raise SMBException(
+                f"Server selected dialect 0x{dialect:04X} that was not offered by the client: "
+                f"{', '.join(f'0x{d:04X}' for d in self.negotiated_dialects)}"
+            )
+
+        if dialect < Dialects.SMB_3_1_1:
+            return
+
+        contexts = {}
+        for context in smb_response["negotiate_context_list"]:
+            contexts.setdefault(context["context_type"].get_value(), []).append(context)
+
+        if len(contexts.get(NegotiateContextType.SMB2_PREAUTH_INTEGRITY_CAPABILITIES, [])) != 1:
+            raise SMBException(
+                "Negotiate response must contain exactly one SMB2_PREAUTH_INTEGRITY_CAPABILITIES context"
+            )
+
+        for context_type in [
+            NegotiateContextType.SMB2_ENCRYPTION_CAPABILITIES,
+            NegotiateContextType.SMB2_COMPRESSION_CAPABILITIES,
+            NegotiateContextType.SMB2_RDMA_TRANSFORM_CAPABILITIES,
+            NegotiateContextType.SMB2_SIGNING_CAPABILITIES,
+            NegotiateContextType.SMB2_TRANSPORT_CAPABILITIES,
+        ]:
+            if len(contexts.get(context_type, [])) > 1:
+                raise SMBException(f"Negotiate response contains more than one context of type 0x{context_type:04X}")
+
+        hash_algos = contexts[NegotiateContextType.SMB2_PREAUTH_INTEGRITY_CAPABILITIES][0]["data"]["hash_algorithms"]
+        hash_algos = hash_algos.get_value()
+        if len(hash_algos) != 1 or hash_algos[0] != HashAlgorithms.SHA_512:
+            raise SMBException(f"Negotiate response contains an invalid preauth integrity hash algorithm {hash_algos}")
+
+        for context in contexts.get(NegotiateContextType.SMB2_ENCRYPTION_CAPABILITIES, []):
+            ciphers = context["data"]["ciphers"].get_value()
+            if len(ciphers) != 1 or (ciphers[0] != 0 and ciphers[0] not in encryption_algorithms):
+                raise SMBException(f"Negotiate response contains an invalid encryption cipher {ciphers}")
+
+        for context in contexts.get(NegotiateContextType.SMB2_SIGNING_CAPABILITIES, []):
+            signing = context["data"]["signing_algorithms"].get_value()
+            if len(signing) != 1 or signing[0] not in signing_algorithms:
+                raise SMBException(f"Negotiate response contains an invalid signing algorithm {signing}")
 
     def disconnect(self, close=True, timeout=None):
         """
@@ -1059,7 +1175,11 @@ class Connection:
 
                 response = request.response
                 status = response["status"].get_value()
-                if status == NtStatus.STATUS_PENDING and wait:
+                if status == NtStatus.STATUS_PENDING:
+                    if not wait:
+                        # Keep the request in outstanding_requests so the final response can still be matched to it.
+                        break
+
                     # Received a pending message, clear the response_event flag and wait again.
                     request.response_event.clear()
                     continue
@@ -1091,11 +1211,14 @@ class Connection:
                     tree = session.tree_connect_table[request.message["tree_id"].get_value()]
 
                     old_create = request.get_message_data()
-                    tree_share_name = tree.share_name + "\\"
-                    original_path = tree_share_name + to_text(
-                        old_create["buffer_path"].get_value(), encoding="utf-16-le"
-                    )
-                    new_path = reparse_buffer.resolve_path(original_path)[len(tree_share_name) :]
+                    create_path = to_text(old_create["buffer_path"].get_value(), encoding="utf-16-le")
+                    if tree.is_dfs_share:
+                        # MS-SMB2 3.2.4.3 - CREATE paths on a DFS share are already DFS pathnames in the form
+                        # server\share\path and the redirected path must be sent in the same form.
+                        new_path = reparse_buffer.resolve_path("\\\\" + create_path)[2:]
+                    else:
+                        tree_share_name = tree.share_name + "\\"
+                        new_path = reparse_buffer.resolve_path(tree_share_name + create_path)[len(tree_share_name) :]
 
                     new_open = Open(tree, new_path)
                     create_req = new_open.create(
@@ -1138,7 +1261,13 @@ class Connection:
                     message_id = request.message["message_id"].get_value()
                     self.outstanding_requests.pop(message_id, None)
 
-                    if status not in [NtStatus.STATUS_SUCCESS, NtStatus.STATUS_PENDING]:
+                    # MS-SMB2 3.3.4.4 - STATUS_BUFFER_OVERFLOW is a warning for these commands and the response
+                    # contains valid, truncated data that must be returned to the caller.
+                    is_buffer_overflow = (
+                        status == NtStatus.STATUS_BUFFER_OVERFLOW
+                        and response["command"].get_value() in self._BUFFER_OVERFLOW_COMMANDS
+                    )
+                    if status != NtStatus.STATUS_SUCCESS and not is_buffer_overflow:
                         raise SMBResponseException(response)
 
                     break
@@ -1179,10 +1308,16 @@ class Connection:
         """
         Verifies the SMB2 Header request/response signature.
 
+        The signature of a signed message is always verified. When the session requires signing (or force is set), a
+        message without SMB2_FLAGS_SIGNED is rejected as the flag itself is not protected and could have been
+        cleared by an attacker. MS-SMB2 3.2.5.1.3 only allows the verification to be skipped for decrypted messages,
+        unsolicited messages with the MessageId 0xFFFFFFFFFFFFFFFF, and interim STATUS_PENDING responses.
+
         :param header: The SMB2Header that will have its signature verified against the signing key specified.
         :param session_id: The Session Id to denote what session security verifies the message.
         :param force: Force verification of the header even if it does not match the criteria required in normal
             scenarios.
+        :return: True if the signature was verified, False if no verification was required.
         """
         message_id = header["message_id"].get_value()
         flags = header["flags"]
@@ -1191,15 +1326,29 @@ class Connection:
 
         if not force and (
             message_id == 0xFFFFFFFFFFFFFFFF
-            or not flags.has_flag(Smb2Flags.SMB2_FLAGS_SIGNED)
             or status == NtStatus.STATUS_PENDING
             or command == Commands.SMB2_SESSION_SETUP
         ):
-            return
+            return False
 
+        is_signed = flags.has_flag(Smb2Flags.SMB2_FLAGS_SIGNED)
         session = self.session_table.get(session_id, None)
         if session is None:
+            if not is_signed and not force:
+                # Messages outside of an authenticated session, like NEGOTIATE, are never signed.
+                return False
+
             raise SMBException(f"Failed to find session {session_id} for message verification")
+
+        if not is_signed:
+            signing_required = session.signing_required and session.signing_key
+            if not force and (not signing_required or status in self._UNSIGNED_ERROR_STATUSES):
+                return False
+
+            raise SMBException(
+                f"Server message for session {session_id} with message id {message_id} was not signed but "
+                "signing is required"
+            )
 
         expected = self._generate_signature(
             header.pack(),
@@ -1215,6 +1364,42 @@ class Connection:
             raise SMBException(
                 f"Server message signature could not be verified: {actual_signature} != {expected_signature}",
             )
+
+        return True
+
+    def _wait_for_credits(self, required, unsent=(), timeout=None):
+        """
+        Waits until the sequence window has the required number of message ids available. Must be called with
+        sequence_lock held.
+
+        If no responses are outstanding then no more credits can be granted by the server so the request fails
+        immediately rather than waiting forever.
+
+        :param required: The number of credits the request needs.
+        :param unsent: Requests that have been created but not sent yet, these will not grant any credits.
+        :param timeout: Override the time in seconds to wait for credits, defaults to the receive timeout.
+        """
+        timeout = self._receive_timeout if timeout is None else timeout
+        worker = self._t_worker
+        if worker is not None and threading.get_ident() == worker.ident:
+            # Only the worker thread processes credit grants so it cannot wait for them.
+            timeout = 0
+        end_time = time.monotonic() + timeout
+        while True:
+            available = self.sequence_window["high"] - self.sequence_window["low"]
+            if required <= available:
+                return
+
+            credits_pending = any(
+                r.response is None or r.response["status"].get_value() == NtStatus.STATUS_PENDING
+                for r in list(self.outstanding_requests.values())
+                if not any(r is u for u in unsent)
+            )
+            remaining = end_time - time.monotonic()
+            if not credits_pending or remaining <= 0 or self._t_exc is not None or not self.transport.connected:
+                raise SMBException(f"Request requires {required} credits but only {available} credits are available")
+
+            self._credits_granted.wait(timeout=remaining)
 
     def _check_worker_running(self):
         """Checks that the message worker thread is still running and raises it's exception if it has failed."""
@@ -1264,19 +1449,15 @@ class Connection:
             # sequence windows is done in a thread safe manner so we use a lock to ensure only 1 thread accesses the
             # sequence window at a time.
             with self.sequence_lock:
-                sequence_window_low = self.sequence_window["low"]
-                sequence_window_high = self.sequence_window["high"]
                 credit_charge = self._calculate_credit_charge(message)
-                credits_available = sequence_window_high - sequence_window_low
-                if credit_charge > credits_available:
-                    raise SMBException(
-                        f"Request requires {credit_charge} credits but only {credits_available} "
-                        "credits are available"
-                    )
-
-                current_id = message_id or sequence_window_low
-                if message.COMMAND != Commands.SMB2_CANCEL:
-                    self.sequence_window["low"] += credit_charge if credit_charge > 0 else 1
+                if message.COMMAND == Commands.SMB2_CANCEL:
+                    # MS-SMB2 3.2.4.24 - CANCEL does not consume a message id.
+                    current_id = message_id
+                else:
+                    # MS-SMB2 3.2.4.1.3 - a request that requires more message ids than are available must wait.
+                    self._wait_for_credits(max(credit_charge, 1), unsent=requests)
+                    current_id = message_id or self.sequence_window["low"]
+                    self.sequence_window["low"] += max(credit_charge, 1)
 
             if async_id is None:
                 header = SMB2HeaderRequest()
@@ -1286,9 +1467,14 @@ class Connection:
                 header["flags"].set_flag(Smb2Flags.SMB2_FLAGS_ASYNC_COMMAND)
                 header["async_id"] = async_id
 
+            msg_credit_request = credit_request
+            if msg_credit_request is None:
+                # MS-SMB2 3.2.4.1.2 - request at least the credits consumed so the client never runs out of credits.
+                msg_credit_request = 0 if message.COMMAND == Commands.SMB2_CANCEL else max(credit_charge, 1)
+
             header["credit_charge"] = credit_charge
             header["command"] = message.COMMAND
-            header["credit_request"] = credit_request if credit_request else credit_charge
+            header["credit_request"] = msg_credit_request
             header["message_id"] = current_id
             header["session_id"] = session_id
             header["data"] = message.pack()
@@ -1315,7 +1501,8 @@ class Connection:
             send_data += b_header
 
             if message.COMMAND == Commands.SMB2_CANCEL:
-                request = self.outstanding_requests[header["message_id"].get_value()]
+                # The request being cancelled may have already been completed and removed.
+                request = self.outstanding_requests.get(header["message_id"].get_value(), None)
             else:
                 request = Request(header, type(message), self, session_id=session_id)
                 self.outstanding_requests[header["message_id"].get_value()] = request
@@ -1377,14 +1564,26 @@ class Connection:
                     return
 
                 is_encrypted = b_msg[:4] == b"\xfdSMB"
+                transform_session_id = None
                 if is_encrypted:
                     msg = SMB2TransformHeader()
                     msg.unpack(b_msg)
                     b_msg = self._decrypt(msg)
+                    transform_session_id = msg["session_id"].get_value()
 
+                # MS-SMB2 3.2.5.1 and 3.2.5.1.1.1 - only plain SMB2 messages are expected at this point, compression is
+                # never negotiated and an encrypted message must not contain another transform header.
+                if b_msg[:4] != b"\xfeSMB":
+                    raise SMBException(f"Received message with an unknown or unexpected ProtocolId {b_msg[:4]!r}")
+
+                is_first = True
                 next_command = -1
                 while next_command != 0:
                     next_command = struct.unpack("<L", b_msg[20:24])[0]
+                    if next_command % 8 != 0:
+                        # MS-SMB2 3.2.5.1.9 - each compounded response must start on an 8-byte boundary.
+                        raise SMBException(f"Compounded response NextCommand {next_command} is not 8-byte aligned")
+
                     header_length = next_command if next_command != 0 else len(b_msg)
                     b_header = b_msg[:header_length]
                     b_msg = b_msg[header_length:]
@@ -1392,32 +1591,52 @@ class Connection:
                     header = SMB2HeaderResponse()
                     header.unpack(b_header)
 
+                    if (
+                        is_encrypted
+                        and header["session_id"].get_value() != transform_session_id
+                        and (is_first or not header["flags"].has_flag(Smb2Flags.SMB2_FLAGS_RELATED_OPERATIONS))
+                    ):
+                        # MS-SMB2 3.2.5.1.1.1 - the decrypted message must belong to the session it was encrypted for.
+                        raise SMBException(
+                            f"Decrypted message SessionId {header['session_id'].get_value()} does not match the "
+                            f"transform header SessionId {transform_session_id}"
+                        )
+                    is_first = False
+
                     message_id = header["message_id"].get_value()
-                    request = self.outstanding_requests[message_id]
+                    command = header["command"].get_value()
+                    if message_id == 0xFFFFFFFFFFFFFFFF:
+                        # MS-SMB2 3.2.5.1.2 - an unsolicited message, only an OPLOCK_BREAK is valid.
+                        if command == Commands.SMB2_OPLOCK_BREAK:
+                            self._process_break_notification(header)
+                        else:
+                            log.warning("Discarding unsolicited message with command %s", command)
+                        continue
+
+                    request = self.outstanding_requests.get(message_id, None)
+                    if request is None:
+                        # MS-SMB2 3.2.5.1.2 - a response that does not match a request must be discarded.
+                        log.warning("Discarding response for unknown message id %s", message_id)
+                        continue
 
                     # For SMB2 SESSION_SETUP, the client MUST retrieve SessionId
                     # from SMB2 header of the response. For all other messages,
                     # the client MUST retrieve SessionId from the corresponding
                     # Request.Message.
-                    command = header["command"].get_value()
                     if command == Commands.SMB2_SESSION_SETUP:
                         session_id = header["session_id"].get_value()
                     else:
                         session_id = request.session_id
 
                     # No need to waste CPU cycles to verify the signature if we already decrypted the header.
+                    signature_verified = False
                     if not is_encrypted:
-                        self.verify_signature(header, session_id)
+                        signature_verified = self.verify_signature(header, session_id)
 
                     credit_response = header["credit_response"].get_value()
-                    if credit_response == 0 and not self.supports_multi_credit:
-                        # If the dialect does not support credits we still need to adjust our sequence window.
-                        # Otherwise the credit response may be 0 in the case of compound responses and the last
-                        # response contains the credits that were granted.
-                        credit_response += 1
-
                     with self.sequence_lock:
                         self.sequence_window["high"] += credit_response
+                        self._credits_granted.notify_all()
 
                     status = header["status"].get_value()
                     if command == Commands.SMB2_NEGOTIATE:
@@ -1431,12 +1650,19 @@ class Connection:
                             request.async_id = b_header[32:40]
 
                         request.response = header
+                        request.response_encrypted = is_encrypted
+                        request.response_signature_verified = signature_verified
                         request.response_event.set()
 
-                        # When we send a ping in this thread we want to make sure it doesn't linger in the outstanding
-                        # request queue.
-                        if request.message["reserved"].get_value() == 1:
+                        # When we send a ping or break acknowledgment in this thread we want to make sure it doesn't
+                        # linger in the outstanding request queue.
+                        if status != NtStatus.STATUS_PENDING and (
+                            request.message["reserved"].get_value() == 1 or request.on_response is not None
+                        ):
                             self.outstanding_requests.pop(message_id, None)
+
+                    if request.on_response is not None and status != NtStatus.STATUS_PENDING:
+                        request.on_response(header)
         except Exception as exc:
             log.exception("SMB receive worker died (outstanding=%d)", len(self.outstanding_requests))
 
@@ -1449,8 +1675,139 @@ class Connection:
 
         finally:
             # Make sure we fire all the request events to ensure the main thread isn't waiting on a receive.
-            for request in self.outstanding_requests.values():
+            for request in list(self.outstanding_requests.values()):
                 request.response_event.set()
+
+            # Also wake up any request waiting for credits that will now never be granted.
+            with self.sequence_lock:
+                self._credits_granted.notify_all()
+
+    def _find_open(self, file_id):
+        for session in list(self.session_table.values()):
+            smb_open = session.open_table.get(file_id, None)
+            if smb_open is not None:
+                return smb_open
+
+        return None
+
+    def _process_break_notification(self, header):
+        """
+        [MS-SMB2] 3.2.5.19 Receiving an SMB2 OPLOCK_BREAK Command
+
+        Processes an unsolicited oplock or lease break notification. The library does not cache any data locally so
+        the break is acknowledged straight away with the new oplock level or lease state.
+        """
+        data = header["data"].get_value()
+        structure_size = struct.unpack("<H", data[:2])[0] if len(data) >= 2 else 0
+
+        if structure_size == 24:
+            notification = SMB2OplockBreakNotification()
+            notification.unpack(data)
+            self._process_oplock_break(notification)
+
+        elif (
+            structure_size == 44
+            and self.dialect != Dialects.SMB_2_0_2
+            and (self.supports_file_leasing or self.supports_directory_leasing)
+        ):
+            notification = SMB2LeaseBreakNotification()
+            notification.unpack(data)
+            self._process_lease_break(notification)
+
+        else:
+            log.warning("Discarding OPLOCK_BREAK notification with unexpected StructureSize %d", structure_size)
+
+    def _process_oplock_break(self, notification):
+        smb_open = self._find_open(notification["file_id"].get_value())
+        if smb_open is None:
+            return
+
+        current_level = smb_open.oplock_level
+        new_level = notification["oplock_level"].get_value()
+        log.info("Received oplock break for %s from %s to %s", smb_open.file_name, current_level, new_level)
+
+        if current_level == RequestedOplockLevel.SMB2_OPLOCK_LEVEL_II:
+            if new_level == RequestedOplockLevel.SMB2_OPLOCK_LEVEL_NONE:
+                smb_open.oplock_level = new_level
+            return
+
+        valid_levels = {
+            RequestedOplockLevel.SMB2_OPLOCK_LEVEL_EXCLUSIVE: [
+                RequestedOplockLevel.SMB2_OPLOCK_LEVEL_NONE,
+                RequestedOplockLevel.SMB2_OPLOCK_LEVEL_II,
+            ],
+            RequestedOplockLevel.SMB2_OPLOCK_LEVEL_BATCH: [
+                RequestedOplockLevel.SMB2_OPLOCK_LEVEL_NONE,
+                RequestedOplockLevel.SMB2_OPLOCK_LEVEL_II,
+                RequestedOplockLevel.SMB2_OPLOCK_LEVEL_EXCLUSIVE,
+            ],
+        }.get(current_level, [])
+        if new_level not in valid_levels:
+            return
+
+        smb_open.oplock_level = new_level
+        ack = SMB2OplockBreakAcknowledgment()
+        ack["oplock_level"] = new_level
+        ack["file_id"] = smb_open.file_id
+
+        def on_response(response):
+            # MS-SMB2 3.2.5.19.3
+            if response["status"].get_value() != NtStatus.STATUS_SUCCESS:
+                smb_open.oplock_level = RequestedOplockLevel.SMB2_OPLOCK_LEVEL_NONE
+
+        self._send_break_acknowledgment(ack, smb_open, on_response)
+
+    def _process_lease_break(self, notification):
+        lease_key = notification["lease_key"].get_value()
+        opens = [
+            o
+            for session in list(self.session_table.values())
+            for o in list(session.open_table.values())
+            if o.lease_key == lease_key
+        ]
+        if not opens:
+            return
+
+        new_state = notification["new_lease_state"].get_value()
+        new_epoch = notification["new_epoch"].get_value()
+        log.info("Received lease break for %s to state %d", opens[0].file_name, new_state)
+        for smb_open in opens:
+            if self.dialect >= Dialects.SMB_3_0_0 and smb_open.lease_epoch is not None:
+                if new_epoch != smb_open.lease_epoch and ((new_epoch - smb_open.lease_epoch) & 0xFFFF) <= 32767:
+                    smb_open.lease_state = new_state
+                    smb_open.lease_epoch = new_epoch
+            else:
+                smb_open.lease_state = new_state
+
+        if not notification["flags"].has_flag(LeaseBreakFlags.SMB2_NOTIFY_BREAK_LEASE_FLAG_ACK_REQUIRED):
+            return
+
+        ack = SMB2LeaseBreakAcknowledgment()
+        ack["lease_key"] = lease_key
+        ack["lease_state"] = opens[0].lease_state
+
+        def on_response(response):
+            # MS-SMB2 3.2.5.19.4
+            if response["status"].get_value() != NtStatus.STATUS_SUCCESS:
+                for smb_open in opens:
+                    smb_open.lease_state = 0
+                    smb_open.oplock_level = RequestedOplockLevel.SMB2_OPLOCK_LEVEL_NONE
+
+        self._send_break_acknowledgment(ack, opens[0], on_response)
+
+    def _send_break_acknowledgment(self, message, smb_open, on_response):
+        try:
+            request = self.send(
+                message,
+                sid=smb_open.tree_connect.session.session_id,
+                tid=smb_open.tree_connect.tree_connect_id,
+            )
+        except SMBException as exc:
+            log.warning("Failed to send oplock break acknowledgment for %s: %s", smb_open.file_name, exc)
+            return
+
+        # The response is processed by this worker thread as nothing else waits for it.
+        request.on_response = on_response
 
     def _generate_signature(self, b_header, signing_key, message_id, response, command):
         b_header = b_header[:48] + (b"\x00" * 16) + b_header[64:]
@@ -1698,6 +2055,17 @@ class Connection:
             max_out_size = message["output_buffer_length"].get_value()
             payload_size = max(max_in_size, max_out_size)
 
+        elif message.COMMAND == Commands.SMB2_QUERY_INFO:
+            max_in_size = message["input_buffer_length"].get_value()
+            max_out_size = message["output_buffer_length"].get_value()
+            payload_size = max(max_in_size, max_out_size)
+
+        elif message.COMMAND == Commands.SMB2_SET_INFO:
+            payload_size = message["buffer_length"].get_value()
+
+        elif message.COMMAND == Commands.SMB2_CHANGE_NOTIFY:
+            payload_size = message["output_buffer_length"].get_value()
+
         else:
             payload_size = 1
 
@@ -1740,6 +2108,15 @@ class Request:
         # Cannot rely on the message values as it could be a related compound msg which does not set these values.
         self.session_id = session_id
 
+        # How the response was protected. Used to verify that a response that must be signed or encrypted actually was,
+        # like a VALIDATE_NEGOTIATE_INFO response.
+        self.response_encrypted = False
+        self.response_signature_verified = False
+
+        # Optional callback invoked by the message worker with the final response for requests sent internally, like
+        # an oplock break acknowledgment, that no caller waits on.
+        self.on_response = None
+
         self._connection = connection
         self._message_type = message_type  # Used to rehydrate the message data in case it's needed again.
 
@@ -1759,8 +2136,15 @@ class Request:
         message_obj.unpack(self.message["data"].get_value())
         return message_obj
 
+    @property
+    def response_protected(self):
+        """Whether the response was either encrypted or had its signature verified."""
+        return self.response_encrypted or self.response_signature_verified
+
     def update_request(self, new_request):
         self.async_id = new_request.async_id
+        self.response_encrypted = new_request.response_encrypted
+        self.response_signature_verified = new_request.response_signature_verified
         self.message = new_request.message
         self.timestamp = new_request.timestamp
         self.response = new_request.response

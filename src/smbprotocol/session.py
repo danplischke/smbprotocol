@@ -18,8 +18,15 @@ from smbprotocol.exceptions import (
     SMBAuthenticationError,
     SMBException,
 )
-from smbprotocol.header import Commands, NtStatus
-from smbprotocol.structure import BytesField, EnumField, FlagField, IntField, Structure
+from smbprotocol.header import Commands, NtStatus, Smb2Flags
+from smbprotocol.structure import (
+    BytesField,
+    EnumField,
+    FlagField,
+    IntField,
+    Structure,
+    offset_padding_field,
+)
 
 log = logging.getLogger(__name__)
 
@@ -142,6 +149,8 @@ class SMB2SessionSetupResponse(Structure):
                         default=lambda s: len(s["buffer"]),
                     ),
                 ),
+                # MS-SMB2 3.2.5.3 - the security buffer is located by SecurityBufferOffset.
+                ("padding", offset_padding_field("security_buffer_offset", "security_buffer_length", 72)),
                 (
                     "buffer",
                     BytesField(
@@ -288,6 +297,7 @@ class Session:
         if self.auth_protocol != "negotiate":
             in_token = None  # The GSS Negotiate Token can only be used for Negotiate auth.
 
+        status = None
         while not context.complete:
             try:
                 out_token = context.step(in_token)
@@ -329,6 +339,14 @@ class Session:
             status = response["status"].get_value()
             if status == NtStatus.STATUS_MORE_PROCESSING_REQUIRED:
                 log.info("More processing is required for SMB2_SESSION_SETUP")
+
+        # MS-SMB2 3.2.5.3.1 - authentication is only complete once the server returns STATUS_SUCCESS, a server that
+        # still wants more processing after the local context completed has not authenticated the session.
+        if status != NtStatus.STATUS_SUCCESS:
+            raise SMBAuthenticationError(
+                "Failed to authenticate with server: the authentication exchange completed without the server "
+                "returning STATUS_SUCCESS"
+            )
 
         log.info("Setting session id to %s", self.session_id)
         self._connected = True
@@ -373,7 +391,35 @@ class Session:
             self.signing_key = self.session_key
             self.application_key = self.session_key
 
+        try:
+            self._process_session_flags(setup_response, response)
+        except SMBException:
+            self._connected = False
+            self.connection.session_table.pop(self.session_id, None)
+            raise
+
+    def _process_session_flags(self, setup_response, response):
+        """Processes the final SESSION_SETUP response as specified in MS-SMB2 3.2.5.3.1."""
         flags = setup_response["session_flags"]
+        is_guest = flags.has_flag(SessionFlags.SMB2_SESSION_FLAG_IS_GUEST)
+        is_anonymous = flags.has_flag(SessionFlags.SMB2_SESSION_FLAG_IS_NULL)
+
+        if not (is_guest or is_anonymous):
+            # The final response is signed with the new session's signing key. For 3.1.1 it MUST be signed as it
+            # proves the preauth integrity hash, and therefore the NEGOTIATE exchange, was not tampered with.
+            if self.connection.dialect >= Dialects.SMB_3_1_1:
+                if not response["flags"].has_flag(Smb2Flags.SMB2_FLAGS_SIGNED):
+                    raise SMBException("The final SMB2 SESSION_SETUP response for dialect 3.1.1 was not signed")
+
+                log.info("Verifying the SMB Setup Session signature as auth is successful")
+                self.connection.verify_signature(response, self.session_id, force=True)
+
+            elif self.signing_required and not (
+                flags.has_flag(SessionFlags.SMB2_SESSION_FLAG_ENCRYPT_DATA) or self.require_encryption
+            ):
+                log.info("Verifying the SMB Setup Session signature as auth is successful")
+                self.connection.verify_signature(response, self.session_id, force=True)
+
         if flags.has_flag(SessionFlags.SMB2_SESSION_FLAG_ENCRYPT_DATA) or self.require_encryption:
             # make sure the connection actually supports encryption
             if not self.connection.supports_encryption:
@@ -385,25 +431,31 @@ class Session:
         else:
             self.encrypt_data = False
 
-        if flags.has_flag(SessionFlags.SMB2_SESSION_FLAG_IS_GUEST) or flags.has_flag(
-            SessionFlags.SMB2_SESSION_FLAG_IS_NULL
-        ):
+        if is_guest or is_anonymous:
             self.session_key = None
             self.signing_key = None
             self.application_key = None
             self.encryption_key = None
             self.decryption_key = None
 
-            if self.signing_required or self.encrypt_data:
-                self.session_id = None
+            if self.encrypt_data:
                 raise SMBException(
-                    "SMB encryption or signing was required but session was authenticated as a guest "
-                    "which does not support encryption or signing"
+                    "SMB encryption was required but session was authenticated as a guest or anonymous user which "
+                    "does not support encryption"
                 )
 
-        if self.signing_required:
-            log.info("Verifying the SMB Setup Session signature as auth is successful")
-            self.connection.verify_signature(response, self.session_id, force=True)
+            if self.connection.client_require_signing:
+                # MS-SMB2 3.2.5.3.1 - a guest session when the client requires signing is a SESSION_SETUP failure
+                # and the connection MUST be terminated. The same applies to an anonymous session as the flags are
+                # not protected and could have been set by an attacker to disable signing.
+                self.connection.disconnect(False)
+                raise SMBException(
+                    "SMB signing was required but session was authenticated as a guest or anonymous user which does "
+                    "not support signing"
+                )
+
+            # Guest and anonymous sessions have no session key so cannot sign.
+            self.signing_required = False
 
     def disconnect(self, close=True, timeout=None):
         """

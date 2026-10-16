@@ -758,6 +758,15 @@ class SMB2ErrorContextResponse(Structure):
                         size=lambda s: s["error_data_length"].get_value(),
                     ),
                 ),
+                # MS-SMB2 2.2.2 - each error context starts on an 8-byte aligned boundary. The last context may not be
+                # padded so this only consumes the padding bytes that are present.
+                (
+                    "padding",
+                    BytesField(
+                        size=lambda s: (8 - ((8 + s["error_data_length"].get_value()) % 8)) % 8,
+                        default=lambda s: b"\x00" * ((8 - ((8 + s["error_data_length"].get_value()) % 8)) % 8),
+                    ),
+                ),
             ]
         )
         super().__init__()
@@ -790,6 +799,9 @@ class SMB2SymbolicLinkErrorResponse(Structure):
                 ("substitute_name_length", IntField(size=2)),
                 ("print_name_offset", IntField(size=2)),
                 ("print_name_length", IntField(size=2)),
+                # Flags is a 4 byte field in MS-SMB2 2.2.2.2.1 but only SYMLINK_FLAG_RELATIVE in the lower bits is
+                # defined. Windows sets bits in the upper 2 bytes, e.g. \x00\x80, so they are kept in a separate field
+                # to avoid failing to parse the flags enum.
                 (
                     "flags",
                     EnumField(
@@ -797,8 +809,6 @@ class SMB2SymbolicLinkErrorResponse(Structure):
                         enum_type=SymbolicLinkErrorFlags,
                     ),
                 ),
-                # Not in the spec but Windows seems to add \x00\x80 to the end of flags which breaks our parsing. Cannot
-                # seem to figure out why but this just ignored that field.
                 ("reserved", IntField(size=2)),
                 # use the get/set_name functions to get/set these values as they
                 # also (d)encode the text and set the length and offset accordingly
@@ -809,9 +819,11 @@ class SMB2SymbolicLinkErrorResponse(Structure):
 
     @staticmethod
     def _get_name_length(structure, first=True):
+        # MS-SMB2 2.2.2.2.1 - ReparseDataLength is the size of the PathBuffer plus 12. The PathBuffer may be larger
+        # than the two names, e.g. if they are null terminated, so use it unless it is too small to hold the names.
         print_name_len = structure["print_name_length"].get_value()
         sub_name_len = structure["substitute_name_length"].get_value()
-        return print_name_len + sub_name_len
+        return max(structure["reparse_data_length"].get_value() - 12, print_name_len + sub_name_len)
 
     def set_name(self, print_name, substitute_name):
         """

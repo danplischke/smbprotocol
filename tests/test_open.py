@@ -1278,10 +1278,10 @@ class TestOpen:
             assert open.allocation_size == 0
             assert open.create_action in [CreateAction.FILE_CREATED, CreateAction.FILE_OVERWRITTEN]
             assert isinstance(open.change_time, datetime)
-            assert open.create_disposition is None
-            assert open.create_options is None
+            assert open.create_disposition is CreateDisposition.FILE_OVERWRITE_IF
+            assert open.create_options is CreateOptions.FILE_NON_DIRECTORY_FILE
             assert isinstance(open.creation_time, datetime)
-            assert open.desired_access is None
+            assert open.desired_access is FilePipePrinterAccessMask.MAXIMUM_ALLOWED
             assert not open.durable
             assert open.durable_timeout is None
             assert open.end_of_file == 0
@@ -1292,11 +1292,11 @@ class TestOpen:
             assert isinstance(open.last_access_time, datetime)
             assert open.last_disconnect_time == 0
             assert isinstance(open.last_write_time, datetime)
-            assert open.operation_buckets == []
+            assert open.operation_buckets == [None] + [{"sequence_number": 0, "free": True}] * 64
             assert open.oplock_level == 0
             assert not open.resilient_handle
             assert not open.resilient_timeout
-            assert open.share_mode is None
+            assert open.share_mode == 0
         finally:
             connection.disconnect(True)
 
@@ -1322,10 +1322,10 @@ class TestOpen:
             assert open.allocation_size == 0
             assert open.create_action in [CreateAction.FILE_CREATED, CreateAction.FILE_OVERWRITTEN]
             assert isinstance(open.change_time, datetime)
-            assert open.create_disposition is None
-            assert open.create_options is None
+            assert open.create_disposition is CreateDisposition.FILE_OVERWRITE_IF
+            assert open.create_options is CreateOptions.FILE_NON_DIRECTORY_FILE
             assert isinstance(open.creation_time, datetime)
-            assert open.desired_access is None
+            assert open.desired_access is FilePipePrinterAccessMask.MAXIMUM_ALLOWED
             assert not open.durable
             assert open.durable_timeout is None
             assert open.end_of_file == 0
@@ -1336,11 +1336,11 @@ class TestOpen:
             assert isinstance(open.last_access_time, datetime)
             assert open.last_disconnect_time == 0
             assert isinstance(open.last_write_time, datetime)
-            assert open.operation_buckets == []
+            assert open.operation_buckets == [None] + [{"sequence_number": 0, "free": True}] * 64
             assert open.oplock_level == 0
             assert not open.resilient_handle
             assert not open.resilient_timeout
-            assert open.share_mode is None
+            assert open.share_mode == 0
         finally:
             connection.disconnect(True)
 
@@ -1380,7 +1380,7 @@ class TestOpen:
             assert isinstance(open.last_access_time, datetime)
             assert open.last_disconnect_time == 0
             assert isinstance(open.last_write_time, datetime)
-            assert open.operation_buckets == []
+            assert open.operation_buckets == [None] + [{"sequence_number": 0, "free": True}] * 64
             assert open.oplock_level == 0
             assert not open.resilient_handle
             assert not open.resilient_timeout
@@ -1424,7 +1424,7 @@ class TestOpen:
             assert isinstance(open.last_access_time, datetime)
             assert open.last_disconnect_time == 0
             assert isinstance(open.last_write_time, datetime)
-            assert open.operation_buckets == []
+            assert open.operation_buckets == [None] + [{"sequence_number": 0, "free": True}] * 64
             assert open.oplock_level == 0
             assert not open.resilient_handle
             assert not open.resilient_timeout
@@ -1468,7 +1468,7 @@ class TestOpen:
             assert isinstance(open.last_access_time, datetime)
             assert open.last_disconnect_time == 0
             assert isinstance(open.last_write_time, datetime)
-            assert open.operation_buckets == []
+            assert open.operation_buckets == [None] + [{"sequence_number": 0, "free": True}] * 64
             assert open.oplock_level == 0
             assert not open.resilient_handle
             assert not open.resilient_timeout
@@ -1535,7 +1535,7 @@ class TestOpen:
             assert isinstance(open.last_access_time, datetime)
             assert open.last_disconnect_time == 0
             assert isinstance(open.last_write_time, datetime)
-            assert open.operation_buckets == []
+            assert open.operation_buckets == [None] + [{"sequence_number": 0, "free": True}] * 64
             assert open.oplock_level == 0
             assert not open.resilient_handle
             assert not open.resilient_timeout

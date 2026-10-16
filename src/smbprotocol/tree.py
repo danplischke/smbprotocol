@@ -244,9 +244,16 @@ class TreeConnect:
         connect = SMB2TreeConnectRequest()
         connect["buffer"] = utf_share_name
 
+        # MS-SMB2 3.2.4.2.4 - on 3.1.1 the request MUST be signed unless the session is encrypted, a guest or anonymous
+        # session. Guest and anonymous sessions have no signing key.
+        connection = self.session.connection
+        force_signature = bool(
+            connection.dialect >= Dialects.SMB_3_1_1 and not self.session.encrypt_data and self.session.signing_key
+        )
+
         log.info("Session: %s - Sending Tree Connect message", self.session.username)
         log.debug(connect)
-        request = self.session.connection.send(connect, sid=self.session.session_id)
+        request = connection.send(connect, sid=self.session.session_id, force_signature=force_signature)
 
         log.info("Session: %s - Receiving Tree Connect response", self.session.username)
         response = self.session.connection.receive(request)
@@ -257,21 +264,41 @@ class TreeConnect:
         # https://msdn.microsoft.com/en-us/library/cc246687.aspx
         self.tree_connect_id = response["tree_id"].get_value()
         log.info("Session: %s - Created tree connection with ID %d", self.session.username, self.tree_connect_id)
-        self._connected = True
-        self.session.tree_connect_table[self.tree_connect_id] = self
 
         capabilities = tree_response["capabilities"]
         self.is_dfs_share = use_dfs and capabilities.has_flag(ShareCapabilities.SMB2_SHARE_CAP_DFS)
         self.is_ca_share = capabilities.has_flag(ShareCapabilities.SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY)
 
-        dialect = self.session.connection.dialect
-        if dialect >= Dialects.SMB_3_0_0 and self.session.connection.supports_encryption:
+        dialect = connection.dialect
+        if dialect >= Dialects.SMB_3_0_0 and connection.supports_encryption:
             self.encrypt_data = tree_response["share_flags"].has_flag(ShareFlags.SMB2_SHAREFLAG_ENCRYPT_DATA)
 
             self.is_scaleout_share = capabilities.has_flag(ShareCapabilities.SMB2_SHARE_CAP_SCALEOUT)
 
+        # The tree needs to be in the table for the validation request to be sent over it but is only marked as
+        # connected, and therefore usable, once the negotiation info has been validated.
+        self.session.tree_connect_table[self.tree_connect_id] = self
         if require_secure_negotiate:
-            self._verify_dialect_negotiate()
+            if not self.session.signing_key:
+                # This will only happen if we authenticated with the guest or anonymous user.
+                del self.session.tree_connect_table[self.tree_connect_id]
+                raise SMBException(
+                    "Cannot verify negotiate information without a session signing key. Authenticate with "
+                    "a non-guest or anonymous account or set require_secure_negotiate=False to disable the "
+                    "negotiation info verification checks."
+                )
+
+            try:
+                self._verify_dialect_negotiate()
+            except SMBException:
+                # MS-SMB2 3.2.5.14.12 - a validation failure MUST close all sessions and terminate the connection as
+                # it indicates the negotiation was tampered with.
+                self.session.tree_connect_table.pop(self.tree_connect_id, None)
+                if connection.transport.connected:
+                    connection.disconnect(False)
+                raise
+
+        self._connected = True
 
     def disconnect(self):
         """
@@ -299,14 +326,6 @@ class TreeConnect:
         log_header = f"Session: {self.session.username}, Tree: {self.share_name}"
         log.info("%s - Running secure negotiate process", log_header)
 
-        if not self.session.signing_key:
-            # This will only happen if we authenticated with the guest or anonymous user.
-            raise SMBException(
-                "Cannot verify negotiate information without a session signing key. Authenticate with "
-                "a non-guest or anonymous account or set require_secure_negotiate=False to disable the "
-                "negotiation info verification checks."
-            )
-
         dialect = self.session.connection.dialect
         if dialect >= Dialects.SMB_3_1_1:
             # SMB 3.1.1+ uses the negotiation info to generate the signing key so doesn't need this extra exchange.
@@ -323,7 +342,7 @@ class TreeConnect:
         val_neg["dialects"] = self.session.connection.negotiated_dialects
 
         ioctl_request["buffer"] = val_neg
-        ioctl_request["max_output_response"] = len(val_neg)
+        ioctl_request["max_output_response"] = len(SMB2ValidateNegotiateInfoResponse())
         ioctl_request["flags"] = IOCTLFlags.SMB2_0_IOCTL_IS_FSCTL
         log.info("%s - Sending Secure Negotiate Validation message", log_header)
         log.debug(ioctl_request)
@@ -335,15 +354,18 @@ class TreeConnect:
         try:
             response = self.session.connection.receive(request)
 
-        except (FileClosed, InvalidDeviceRequest, NotSupported) as e:
+        except (FileClosed, InvalidDeviceRequest, NotSupported):
             # https://docs.microsoft.com/en-us/archive/blogs/openspecification/smb3-secure-dialect-negotiation
-            # Older dialects may respond with these exceptions, this is expected and we only want to fail if
-            # they are not signed. Check that header signature was signed, fail if it wasn't. The signature, if
-            # present, would have been verified when the connection received the data.
-            if e.header["signature"].get_value() == b"\x00" * 16:
-                raise
+            # Older dialects may respond with these exceptions, this is expected and we only want to fail if they
+            # were not protected. The message signature, if present, was verified when the connection received it.
+            if not request.response_protected:
+                raise SMBException(f"{log_header} - Secure negotiate error response was neither signed nor encrypted")
 
             return
+
+        # MS-SMB2 3.2.5.14.12 - if the response is neither signed nor encrypted the client MUST terminate the connection.
+        if not request.response_protected:
+            raise SMBException(f"{log_header} - Secure negotiate response was neither signed nor encrypted")
 
         # If we received an actual response we want to validate the info provided matches with what was negotiated.
         ioctl_resp = SMB2IOCTLResponse()

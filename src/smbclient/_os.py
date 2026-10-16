@@ -1228,15 +1228,56 @@ def liststreams(path: str, follow_symlinks=True, **kwargs: t.Any) -> list[SMBFil
         **kwargs,
     )
 
-    with SMBFileTransaction(raw) as transaction:
-        query_info(transaction, FileStreamInformation, output_buffer_length=MAX_PAYLOAD_SIZE)
+    streams = _query_info_list(raw, FileStreamInformation)
 
     return [
         SMBFileStreamInformation(
             s["stream_name"].get_value(), s["stream_size"].get_value(), s["stream_allocation_size"].get_value()
         )
-        for s in transaction.results[0]
+        for s in streams
     ]
+
+
+def _query_info_list(raw, info_class, flags=0):
+    """
+    Queries an information class that returns a variable length list of entries. The query starts with a 64KiB
+    buffer and is retried with a larger buffer if the entries did not fit. A server either returns the truncated
+    entries with STATUS_BUFFER_OVERFLOW, which cannot be used, or fails with STATUS_BUFFER_TOO_SMALL or
+    STATUS_INFO_LENGTH_MISMATCH (MS-SMB2 3.2.5.17).
+
+    :param raw: The SMBRawIO to query.
+    :param info_class: The information class to query.
+    :param flags: Optional flags to set on the query request.
+    :return: The list of entries returned by the server.
+    """
+    output_buffer_length = MAX_PAYLOAD_SIZE
+    while True:
+        try:
+            with SMBFileTransaction(raw) as transaction:
+                query_info(transaction, info_class, flags=flags, output_buffer_length=output_buffer_length)
+
+            return transaction.results[0]
+
+        except SMBOSError as err:
+            if err.ntstatus not in [
+                NtStatus.STATUS_BUFFER_OVERFLOW,
+                NtStatus.STATUS_BUFFER_TOO_SMALL,
+                NtStatus.STATUS_INFO_LENGTH_MISMATCH,
+            ]:
+                raise
+
+            # Use the largest buffer the connection allows and the available credits can cover. The query is sent in a
+            # compound request with a CREATE and CLOSE which consume a credit each.
+            connection = raw.fd.connection
+            available_credits = connection.sequence_window["high"] - connection.sequence_window["low"]
+            larger_length = min(connection.max_transact_size, max(available_credits - 2, 1) * MAX_PAYLOAD_SIZE)
+            if not connection.supports_multi_credit:
+                larger_length = min(larger_length, MAX_PAYLOAD_SIZE)
+
+            if larger_length <= output_buffer_length:
+                raise
+
+            output_buffer_length = larger_length
 
 
 def _delete(raw_type, path, **kwargs):
@@ -1288,21 +1329,15 @@ def _get_extended_attributes(path, follow_symlinks=True, **kwargs):
     )
 
     try:
-        with SMBFileTransaction(raw) as transaction:
-            # We don't know the EA size and FileEaInformation is too unreliable so just set the max size to the SMB2
-            # payload length. It seems to fail if it goes any higher than this.
-            query_info(
-                transaction,
-                FileFullEaInformation,
-                flags=QueryInfoFlags.SL_RESTART_SCAN,
-                output_buffer_length=MAX_PAYLOAD_SIZE,
-            )
+        # We don't know the EA size and FileEaInformation is too unreliable so start with the SMB2 payload length and
+        # retry with a larger buffer if the server reports the EAs did not fit.
+        eas = _query_info_list(raw, FileFullEaInformation, flags=QueryInfoFlags.SL_RESTART_SCAN)
     except SMBOSError as err:
         if err.ntstatus == NtStatus.STATUS_NO_EAS_ON_FILE:
             return []
         raise
 
-    return [(e["ea_name"].get_value(), e["ea_value"].get_value()) for e in transaction.results[0]]
+    return [(e["ea_name"].get_value(), e["ea_value"].get_value()) for e in eas]
 
 
 def _get_reparse_point(path, **kwargs):

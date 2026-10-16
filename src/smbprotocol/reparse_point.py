@@ -159,12 +159,9 @@ class SymbolicLinkReparseDataBuffer(Structure):
                         enum_type=SymbolicLinkFlags,
                     ),
                 ),
-                (
-                    "buffer",
-                    BytesField(
-                        size=lambda s: s["substitute_name_length"].get_value() + s["print_name_length"].get_value(),
-                    ),
-                ),
+                # The names are located by their offsets in the PathBuffer which is the remainder of the reparse data,
+                # it may contain more than the two names, e.g. null terminators or padding between them.
+                ("buffer", BytesField()),
             ]
         )
         super().__init__()
