@@ -175,3 +175,59 @@ def server_test_recv_closed_client(server):
     sock.recv(1)
     sock.shutdown(socket.SHUT_RDWR)
     sock.close()
+
+
+class _PartialSocket:
+    """Socket stand-in whose send calls only accept a few bytes at a time."""
+
+    def __init__(self, max_send):
+        self.max_send = max_send
+        self.data = bytearray()
+        self.calls = 0
+
+    def sendmsg(self, buffers):
+        self.calls += 1
+        sent = 0
+        for buffer in buffers:
+            take = bytes(buffer[: self.max_send - sent])
+            self.data += take
+            sent += len(take)
+            if sent == self.max_send:
+                break
+        return sent
+
+
+class _NoSendmsgSocket:
+    def __init__(self):
+        self.data = bytearray()
+
+    def sendall(self, data):
+        self.data += data
+
+
+@pytest.mark.parametrize("max_send", [1, 3, 4, 5, 1 << 20])
+def test_send_partial_sendmsg(max_send):
+    tcp = Tcp("0.0.0.0", 0)
+    tcp._sock = _PartialSocket(max_send)
+    tcp.send(b"\xfeSMB" + b"\x01" * 13)
+
+    assert bytes(tcp._sock.data) == b"\x00\x00\x00\x11\xfeSMB" + b"\x01" * 13
+    assert tcp._sock.calls == -(-21 // max_send)
+
+
+def test_send_structure():
+    tcp = Tcp("0.0.0.0", 0)
+    tcp._sock = _PartialSocket(2)
+    packet = DirectTCPPacket()
+    packet["smb2_message"] = b"\xfeSMB"
+    tcp.send(packet)
+
+    assert bytes(tcp._sock.data) == b"\x00\x00\x00\x08" + packet.pack()
+
+
+def test_send_without_sendmsg():
+    tcp = Tcp("0.0.0.0", 0)
+    tcp._sock = _NoSendmsgSocket()
+    tcp.send(b"\xfeSMB")
+
+    assert bytes(tcp._sock.data) == b"\x00\x00\x00\x04\xfeSMB"

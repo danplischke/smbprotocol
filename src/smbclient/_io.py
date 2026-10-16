@@ -583,6 +583,21 @@ class SMBRawIO(io.RawIOBase):
 
         :return: The byte string read from the SMB file.
         """
+        if self.FILE_TYPE != "pipe":
+            # The size is known so read straight into a single buffer rather than copying each chunk into it.
+            remaining = max(self.fd.end_of_file - self._offset, 0)
+            data = bytearray(remaining)
+            with memoryview(data) as view:
+                bytes_read = 0
+                while bytes_read < remaining:
+                    chunk_read = self.readinto(view[bytes_read:])
+                    if not chunk_read:
+                        break
+                    bytes_read += chunk_read
+
+            del data[bytes_read:]
+            return bytes(data)
+
         data = bytearray()
         while True:
             read_length = min(

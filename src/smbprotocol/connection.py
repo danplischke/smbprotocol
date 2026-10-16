@@ -16,7 +16,7 @@ from threading import Lock
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import cmac
-from cryptography.hazmat.primitives.ciphers import aead, algorithms
+from cryptography.hazmat.primitives.ciphers import Cipher, aead, algorithms, modes
 
 from smbprotocol import MAX_PAYLOAD_SIZE, Dialects
 from smbprotocol._text import to_text
@@ -1304,7 +1304,7 @@ class Connection:
 
         return response["credit_response"].get_value()
 
-    def verify_signature(self, header, session_id, force=False):
+    def verify_signature(self, header, session_id, force=False, b_header=None):
         """
         Verifies the SMB2 Header request/response signature.
 
@@ -1317,6 +1317,7 @@ class Connection:
         :param session_id: The Session Id to denote what session security verifies the message.
         :param force: Force verification of the header even if it does not match the criteria required in normal
             scenarios.
+        :param b_header: The raw bytes the header was unpacked from, avoids packing the message again when set.
         :return: True if the signature was verified, False if no verification was required.
         """
         message_id = header["message_id"].get_value()
@@ -1351,7 +1352,7 @@ class Connection:
             )
 
         expected = self._generate_signature(
-            header.pack(),
+            header.pack() if b_header is None else b_header,
             session.signing_key,
             message_id,
             flags.has_flag(Smb2Flags.SMB2_FLAGS_SERVER_TO_REDIR),
@@ -1421,7 +1422,7 @@ class Connection:
         async_id=None,
         force_signature=False,
     ):
-        send_data = b""
+        send_parts = []
         requests = []
         session = self.session_table.get(session_id, None)
         tree = None
@@ -1486,19 +1487,28 @@ class Connection:
             if i != 0 and related:
                 header["flags"].set_flag(Smb2Flags.SMB2_FLAGS_RELATED_OPERATIONS)
 
-            if force_signature or (session and session.signing_required and session.signing_key):
+            # The header and the message data are kept separate until the final join so the data, which can be
+            # multiple MiB for a READ response or WRITE request, is copied only once.
+            sign = force_signature or (session and session.signing_required and session.signing_key)
+            if sign:
                 header["flags"].set_flag(Smb2Flags.SMB2_FLAGS_SIGNED)
-                b_header = header.pack() + padding
-                signature = self._generate_signature(b_header, session.signing_key, current_id, False, message.COMMAND)
 
-                # To save on unpacking and re-packing, manually adjust the signature and update the request object for
-                # back-referencing.
-                b_header = b_header[:48] + signature + b_header[64:]
+            b_fixed = b"".join(field.pack() for name, field in header.fields.items() if name != "data")
+            b_data = header["data"].get_value()
+            if sign:
+                signature = self._calculate_signature(
+                    (memoryview(b_fixed)[:48], b"\x00" * 16, b_data, padding),
+                    session.signing_key,
+                    current_id,
+                    False,
+                    message.COMMAND,
+                )
                 header["signature"] = signature
+                b_header = b"".join((b_fixed[:48], signature, b_data, padding))
             else:
-                b_header = header.pack() + padding
+                b_header = b"".join((b_fixed, b_data, padding))
 
-            send_data += b_header
+            send_parts.append(b_header)
 
             if message.COMMAND == Commands.SMB2_CANCEL:
                 # The request being cancelled may have already been completed and removed.
@@ -1519,6 +1529,7 @@ class Connection:
         if related:
             requests[0].related_ids = [r.message["message_id"].get_value() for r in requests][1:]
 
+        send_data = b"".join(send_parts)
         if session and session.encrypt_data or tree and tree.encrypt_data:
             send_data = self._encrypt(send_data, session)
 
@@ -1631,7 +1642,7 @@ class Connection:
                     # No need to waste CPU cycles to verify the signature if we already decrypted the header.
                     signature_verified = False
                     if not is_encrypted:
-                        signature_verified = self.verify_signature(header, session_id)
+                        signature_verified = self.verify_signature(header, session_id, b_header=b_header)
 
                     credit_response = header["credit_response"].get_value()
                     with self.sequence_lock:
@@ -1810,8 +1821,15 @@ class Connection:
         request.on_response = on_response
 
     def _generate_signature(self, b_header, signing_key, message_id, response, command):
-        b_header = b_header[:48] + (b"\x00" * 16) + b_header[64:]
+        # The signature is calculated over the message with the signature field zeroed. Pass the message in pieces so a
+        # large message is not copied just to blank 16 bytes.
+        view = memoryview(b_header)
+        return self._calculate_signature(
+            (view[:48], b"\x00" * 16, view[64:]), signing_key, message_id, response, command
+        )
 
+    def _calculate_signature(self, parts, signing_key, message_id, response, command):
+        """Signs the concatenation of the bytes-like objects in parts, the signature field must already be zeroed."""
         if self.dialect >= Dialects.SMB_3_1_1 and self.signing_algorithm_id is not None:
             sign_id = self.signing_algorithm_id
 
@@ -1835,15 +1853,23 @@ class Connection:
                     message_info.to_bytes(4, byteorder="little"),
                 ]
             )
-            signature = aead.AESGCM(signing_key).encrypt(nonce, b"", b_header)
+            # GMAC is AES-GCM over no plaintext with the message as the additional data.
+            encryptor = Cipher(algorithms.AES(signing_key), modes.GCM(nonce), backend=default_backend()).encryptor()
+            for part in parts:
+                encryptor.authenticate_additional_data(part)
+            encryptor.finalize()
+            signature = encryptor.tag
 
         elif sign_id == SigningAlgorithms.AES_CMAC:
             c = cmac.CMAC(algorithms.AES(signing_key), backend=default_backend())
-            c.update(b_header)
+            for part in parts:
+                c.update(part)
             signature = c.finalize()
 
         else:
-            hmac_algo = hmac.new(signing_key, msg=b_header, digestmod=hashlib.sha256)
+            hmac_algo = hmac.new(signing_key, digestmod=hashlib.sha256)
+            for part in parts:
+                hmac_algo.update(part)
             signature = hmac_algo.digest()[:16]
 
         return signature
@@ -1905,7 +1931,11 @@ class Connection:
         enc_message = message["data"].get_value() + signature
 
         c = cipher(session.decryption_key)
-        dec_message = c.decrypt(nonce, enc_message, message.pack()[20:52])
+        # The AAD is the transform header from the Nonce field onwards (MS-SMB2 3.1.4.3), without the encrypted data.
+        aad = b"".join(
+            message[name].pack() for name in ("nonce", "original_message_size", "reserved", "flags", "session_id")
+        )
+        dec_message = c.decrypt(nonce, enc_message, aad)
         return dec_message
 
     def _send_smb2_negotiate(self, dialect, timeout, encryption_algorithms, signing_algorithms):

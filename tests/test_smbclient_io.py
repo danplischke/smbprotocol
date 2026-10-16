@@ -39,3 +39,45 @@ def test_del_emits_resource_warning_for_leaked_handle(raw):
 
     with pytest.warns(ResourceWarning, match=r"unclosed SMB handle"):
         raw.__del__()
+
+
+def _raw_with_reads(mocker, raw_type, end_of_file, chunks):
+    raw = raw_type.__new__(raw_type)
+    raw.fd = mocker.MagicMock()
+    raw.fd.connected = False
+    raw.fd.end_of_file = end_of_file
+    raw.fd.connection.max_read_size = 65536
+    raw._offset = 0
+    reads = list(chunks)
+
+    def readinto(b):
+        data = reads.pop(0) if reads else b""
+        b[: len(data)] = data
+        raw._offset += len(data)
+        return len(data)
+
+    raw.readinto = readinto
+    return raw
+
+
+def test_readall_file(mocker):
+    raw = _raw_with_reads(mocker, io.SMBFileIO, 8, [b"abc", b"defgh"])
+    assert raw.readall() == b"abcdefgh"
+
+
+def test_readall_file_shrunk(mocker):
+    # The server returned less data than the cached end of file.
+    raw = _raw_with_reads(mocker, io.SMBFileIO, 10, [b"abcd", b"efg"])
+    assert raw.readall() == b"abcdefg"
+
+
+def test_readall_file_at_end(mocker):
+    raw = _raw_with_reads(mocker, io.SMBFileIO, 4, [b"abcd"])
+    raw._offset = 4
+    assert raw.readall() == b""
+
+
+def test_readall_pipe(mocker):
+    # A pipe has no end of file, it is read until no more data is returned.
+    raw = _raw_with_reads(mocker, io.SMBPipeIO, 0, [b"abc", b"def"])
+    assert raw.readall() == b"abcdef"

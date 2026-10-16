@@ -1,12 +1,17 @@
 # Copyright: (c) 2019, Jordan Borean (@jborean93) <jborean93@gmail.com>
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
+import hashlib
+import hmac
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
 
 import pytest
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import cmac
+from cryptography.hazmat.primitives.ciphers import aead, algorithms
 
 from smbprotocol import Dialects
 from smbprotocol.connection import (
@@ -36,8 +41,9 @@ from smbprotocol.exceptions import (
     SMBException,
     StoppedOnSymlink,
 )
-from smbprotocol.header import Smb2Flags, SMB2HeaderResponse
+from smbprotocol.header import Commands, Smb2Flags, SMB2HeaderResponse
 from smbprotocol.ioctl import SMB2IOCTLRequest
+from smbprotocol.open import SMB2WriteRequest
 from smbprotocol.session import Session
 from smbprotocol.tree import TreeConnect
 
@@ -1377,3 +1383,128 @@ class TestConnection:
             connection.receive(request)
 
         assert len(connection.outstanding_requests) == 0
+
+
+def _reference_signature(sign_id, key, b_message, message_id, response):
+    """Signature as defined by MS-SMB2 3.1.4.1, calculated over a copy of the message with a zeroed signature."""
+    zeroed = b_message[:48] + b"\x00" * 16 + b_message[64:]
+    if sign_id == SigningAlgorithms.AES_GMAC:
+        nonce = message_id.to_bytes(8, "little") + (1 if response else 0).to_bytes(4, "little")
+        return aead.AESGCM(key).encrypt(nonce, b"", zeroed)
+    elif sign_id == SigningAlgorithms.AES_CMAC:
+        c = cmac.CMAC(algorithms.AES(key))
+        c.update(zeroed)
+        return c.finalize()
+    else:
+        return hmac.new(key, zeroed, hashlib.sha256).digest()[:16]
+
+
+SIGNING_CASES = [
+    (Dialects.SMB_2_1_0, None, SigningAlgorithms.HMAC_SHA256),
+    (Dialects.SMB_3_0_2, None, SigningAlgorithms.AES_CMAC),
+    (Dialects.SMB_3_1_1, SigningAlgorithms.AES_CMAC, SigningAlgorithms.AES_CMAC),
+    (Dialects.SMB_3_1_1, SigningAlgorithms.AES_GMAC, SigningAlgorithms.AES_GMAC),
+]
+
+
+class TestSigningWithoutCopies:
+    def _connection(self, mocker, dialect, signing_algorithm_id):
+        connection = Connection(uuid.uuid4(), "server", 445, True)
+        connection.dialect = dialect
+        connection.signing_algorithm_id = signing_algorithm_id
+        connection.sequence_window["high"] = 100
+        connection.transport = mocker.MagicMock()
+        connection.transport.connected = True
+
+        session = mocker.MagicMock()
+        session.session_id = 1
+        session.signing_required = True
+        session.signing_key = b"\x02" * 16
+        session.encrypt_data = False
+        connection.session_table[1] = session
+        return connection
+
+    @pytest.mark.parametrize("dialect, signing_algorithm_id, sign_id", SIGNING_CASES)
+    @pytest.mark.parametrize("size", [64, 65, 4096, 1024 * 1024 + 3])
+    def test_generate_signature(self, mocker, dialect, signing_algorithm_id, sign_id, size):
+        connection = self._connection(mocker, dialect, signing_algorithm_id)
+        # A non-zero signature field must be ignored.
+        b_message = (bytes(range(256)) * (size // 256 + 1))[:size]
+
+        expected = _reference_signature(sign_id, b"\x02" * 16, b_message, 5, True)
+        actual = connection._generate_signature(b_message, b"\x02" * 16, 5, True, Commands.SMB2_READ)
+        assert actual == expected
+
+    @pytest.mark.parametrize("dialect, signing_algorithm_id, sign_id", SIGNING_CASES)
+    def test_send_signed_compound(self, mocker, dialect, signing_algorithm_id, sign_id):
+        connection = self._connection(mocker, dialect, signing_algorithm_id)
+
+        messages = []
+        for size in (5, 1024 * 1024):
+            write = SMB2WriteRequest()
+            write["file_id"] = b"\xff" * 16
+            write["buffer"] = os.urandom(size)
+            messages.append(write)
+
+        requests = connection.send_compound(messages, sid=1, tid=None)
+        sent = connection.transport.send.call_args[0][0]
+
+        offset = 0
+        for request in requests:
+            next_command = request.message["next_command"].get_value()
+            b_header = sent[offset : offset + next_command] if next_command else sent[offset:]
+            message_id = request.message["message_id"].get_value()
+
+            assert b_header == request.message.pack() + b"\x00" * (len(b_header) - len(request.message))
+            assert request.message["flags"].has_flag(Smb2Flags.SMB2_FLAGS_SIGNED)
+            assert b_header[48:64] == _reference_signature(sign_id, b"\x02" * 16, b_header, message_id, False)
+            offset += next_command
+
+    def test_send_unsigned(self, mocker):
+        connection = self._connection(mocker, Dialects.SMB_3_1_1, SigningAlgorithms.AES_GMAC)
+        connection.session_table[1].signing_required = False
+
+        write = SMB2WriteRequest()
+        write["file_id"] = b"\xff" * 16
+        write["buffer"] = b"data"
+        request = connection.send(write, sid=1)
+
+        sent = connection.transport.send.call_args[0][0]
+        assert sent == request.message.pack()
+        assert sent[48:64] == b"\x00" * 16
+        assert not request.message["flags"].has_flag(Smb2Flags.SMB2_FLAGS_SIGNED)
+
+    @pytest.mark.parametrize("dialect, signing_algorithm_id, sign_id", SIGNING_CASES)
+    def test_verify_signature_raw_bytes(self, mocker, dialect, signing_algorithm_id, sign_id):
+        connection = self._connection(mocker, dialect, signing_algorithm_id)
+
+        header = SMB2HeaderResponse()
+        header["command"] = Commands.SMB2_READ
+        header["message_id"] = 2
+        header["session_id"] = 1
+        header["flags"] = Smb2Flags.SMB2_FLAGS_SERVER_TO_REDIR | Smb2Flags.SMB2_FLAGS_SIGNED
+        header["data"] = os.urandom(1024)
+        header["signature"] = _reference_signature(sign_id, b"\x02" * 16, header.pack(), 2, True)
+        b_header = header.pack()
+
+        assert connection.verify_signature(header, 1, b_header=b_header) is True
+
+        tampered = b_header[:-1] + bytes([b_header[-1] ^ 1])
+        with pytest.raises(SMBException, match="signature could not be verified"):
+            connection.verify_signature(header, 1, b_header=tampered)
+
+    @pytest.mark.parametrize("cipher", [Ciphers.AES_128_CCM, Ciphers.AES_128_GCM, Ciphers.AES_256_GCM])
+    def test_encrypt_decrypt_round_trip(self, mocker, cipher):
+        connection = self._connection(mocker, Dialects.SMB_3_1_1, SigningAlgorithms.AES_GMAC)
+        connection.cipher_id = cipher
+        session = connection.session_table[1]
+        session.encryption_key = session.decryption_key = b"\x03" * (32 if cipher == Ciphers.AES_256_GCM else 16)
+        data = os.urandom(70000)
+
+        transform = SMB2TransformHeader()
+        transform.unpack(connection._encrypt(data, session).pack())
+        assert connection._decrypt(transform) == data
+
+        transform["nonce"] = b"\x01" + transform["nonce"].get_value()[1:]
+        with pytest.raises(InvalidTag):
+            connection._decrypt(transform)

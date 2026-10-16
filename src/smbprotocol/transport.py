@@ -93,22 +93,34 @@ class Tcp:
                     self.connected = False
 
     def send(self, header):
-        b_msg = header
+        b_msg = header.pack() if isinstance(header, Structure) else header
         data_length = len(b_msg)
         if data_length > self.MAX_SIZE:
             raise ValueError(
                 f"Data to be sent over Direct TCP size {data_length} exceeds the max length allowed {self.MAX_SIZE}"
             )
 
-        tcp_packet = DirectTCPPacket()
-        tcp_packet["smb2_message"] = b_msg
-
-        data = tcp_packet.pack()
-
+        # The Direct TCP header is sent alongside the message instead of building a new packet so the (potentially
+        # multi MiB) message is not copied.
+        b_length = struct.pack(">L", data_length)
         with self._sock_lock:
-            while data:
-                sent = self._sock.send(data)
-                data = data[sent:]
+            if hasattr(self._sock, "sendmsg"):
+                self._sendmsg_all([b_length, b_msg])
+            else:
+                # Windows does not support sendmsg.
+                self._sock.sendall(b_length + b_msg)
+
+    def _sendmsg_all(self, buffers):
+        views = [memoryview(b) for b in buffers if len(b)]
+        while views:
+            sent = self._sock.sendmsg(views)
+            while sent:
+                if sent >= len(views[0]):
+                    sent -= len(views[0])
+                    views.pop(0)
+                else:
+                    views[0] = views[0][sent:]
+                    sent = 0
 
     def recv(self, timeout):
         # We don't need a lock for recv as the receiver is called from 1 thread.
@@ -122,10 +134,11 @@ class Tcp:
 
     def _recv(self, length, timeout):
         buffer = bytearray(length)
+        view = memoryview(buffer)
         offset = 0
         while offset < length:
             read_len = length - offset
-            log.debug(f"Socket recv({read_len}) (total {length})")
+            log.debug("Socket recv(%d) (total %d)", read_len, length)
 
             start_time = timeit.default_timer()
 
@@ -141,7 +154,7 @@ class Tcp:
                     raise TimeoutError(f"recv idle for {elapsed:.1f}s ({offset}/{length} bytes)")
 
                 try:
-                    b_data = self._sock.recv(read_len)
+                    read_len = self._sock.recv_into(view[offset:], read_len)
                 except OSError as e:
                     # Windows will raise this error if the socket has been shutdown, Linux return returns an empty byte
                     # string so we just replicate that.
@@ -152,16 +165,14 @@ class Tcp:
                         "socket aborted by peer (%s), treating as EOF",
                         errno.errorcode.get(e.errno, e.errno),
                     )
-                    b_data = b""
+                    read_len = 0
 
-            read_len = len(b_data)
-            log.debug(f"Socket recv() returned {read_len} bytes (total {length})")
+            log.debug("Socket recv() returned %d bytes (total %d)", read_len, length)
 
             if read_len == 0:
                 self.close()
                 return None, timeout  # The socket has been shutdown
 
-            buffer[offset : offset + read_len] = b_data
             offset += read_len
 
         return bytes(buffer), timeout

@@ -28,12 +28,16 @@ from smbclient._os import (
     symlink,
 )
 from smbclient.path import isdir, islink, samefile
-from smbprotocol import MAX_PAYLOAD_SIZE
 from smbprotocol.exceptions import SMBOSError
 from smbprotocol.file_info import FileAttributes, FileBasicInformation
 from smbprotocol.header import NtStatus
 from smbprotocol.open import CreateOptions, FilePipePrinterAccessMask
 from smbprotocol.structure import DateTimeField
+
+# Chunk size used when copying through the client. Each chunk is read or written with as few requests as the negotiated
+# max read/write size and credits allow (8 MiB on Windows and Samba). Copying in 64 KiB chunks made every 64 KiB a full
+# round trip to the server.
+COPY_BUFSIZE = 8 * 1024 * 1024
 
 
 def _basename(path):
@@ -196,7 +200,7 @@ def copyfile(src, dst, follow_symlinks=True, **kwargs):
 
     # Finally we are copying across different roots so we just chunk the data using copyfileobj
     with src_open(src, mode="rb", **src_open_kwargs) as src_fd, dst_open(dst, mode="wb", **dst_kwargs) as dst_fd:
-        copyfileobj(src_fd, dst_fd, MAX_PAYLOAD_SIZE)
+        copyfileobj(src_fd, dst_fd, COPY_BUFSIZE)
 
     return dst
 
